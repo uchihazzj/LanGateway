@@ -10,7 +10,9 @@ pub fn show_all() -> Result<Vec<PortproxyEntry>, String> {
         let stdout = encoding::decode(&output.stdout);
         return Err(format!(
             "netsh show all failed (exit {:?}): stdout={}, stderr={}",
-            output.status.code(), stdout.trim(), stderr.trim()
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
         ));
     }
 
@@ -63,21 +65,28 @@ fn parse_show_all(output: &str) -> Vec<PortproxyEntry> {
     entries
 }
 
-pub fn add_v4tov4(listen_port: u16, connect_address: &str, connect_port: u16) -> Result<(), String> {
+pub fn add_v4tov4(
+    listen_port: u16,
+    connect_address: &str,
+    connect_port: u16,
+) -> Result<(), String> {
     let listen_port_arg = format!("listenport={}", listen_port);
     let connect_port_arg = format!("connectport={}", connect_port);
     let connect_addr_arg = format!("connectaddress={}", connect_address);
 
     let args = &[
-        "interface", "portproxy", "add", "v4tov4",
+        "interface",
+        "portproxy",
+        "add",
+        "v4tov4",
         &listen_port_arg,
         "listenaddress=0.0.0.0",
         &connect_port_arg,
         &connect_addr_arg,
     ];
 
-    let output = process::run_command("netsh", args)
-        .map_err(|e| format!("Failed to run netsh: {}", e))?;
+    let output =
+        process::run_command("netsh", args).map_err(|e| format!("Failed to run netsh: {}", e))?;
 
     if output.status.success() {
         Ok(())
@@ -86,7 +95,10 @@ pub fn add_v4tov4(listen_port: u16, connect_address: &str, connect_port: u16) ->
         let stdout = encoding::decode(&output.stdout);
         Err(format!(
             "netsh add failed (exit {:?}): args={:?} stdout={} stderr={}",
-            output.status.code(), args, stdout.trim(), stderr.trim()
+            output.status.code(),
+            args,
+            stdout.trim(),
+            stderr.trim()
         ))
     }
 }
@@ -96,13 +108,16 @@ pub fn delete_v4tov4(listen_port: u16, listen_address: &str) -> Result<(), Strin
     let listen_addr_arg = format!("listenaddress={}", listen_address);
 
     let args = &[
-        "interface", "portproxy", "delete", "v4tov4",
+        "interface",
+        "portproxy",
+        "delete",
+        "v4tov4",
         &listen_port_arg,
         &listen_addr_arg,
     ];
 
-    let output = process::run_command("netsh", args)
-        .map_err(|e| format!("Failed to run netsh: {}", e))?;
+    let output =
+        process::run_command("netsh", args).map_err(|e| format!("Failed to run netsh: {}", e))?;
 
     if output.status.success() {
         Ok(())
@@ -125,15 +140,24 @@ mod tests {
         // We can only test the parameter construction, not actual netsh execution
         // Verify format strings produce correct key=value pairs
         assert_eq!(format!("listenport={}", 5000u16), "listenport=5000");
-        assert_eq!(format!("listenaddress={}", "0.0.0.0"), "listenaddress=0.0.0.0");
+        assert_eq!(
+            format!("listenaddress={}", "0.0.0.0"),
+            "listenaddress=0.0.0.0"
+        );
         assert_eq!(format!("connectport={}", 80u16), "connectport=80");
-        assert_eq!(format!("connectaddress={}", "10.0.0.1"), "connectaddress=10.0.0.1");
+        assert_eq!(
+            format!("connectaddress={}", "10.0.0.1"),
+            "connectaddress=10.0.0.1"
+        );
     }
 
     #[test]
     fn delete_v4tov4_uses_equals_sign_format() {
         assert_eq!(format!("listenport={}", 5000u16), "listenport=5000");
-        assert_eq!(format!("listenaddress={}", "0.0.0.0"), "listenaddress=0.0.0.0");
+        assert_eq!(
+            format!("listenaddress={}", "0.0.0.0"),
+            "listenaddress=0.0.0.0"
+        );
     }
 
     #[test]

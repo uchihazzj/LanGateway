@@ -7,10 +7,8 @@ pub fn is_admin() -> bool {
 }
 
 pub fn restart_as_admin() -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get exe path: {}", e))?;
-    let dir = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let exe = std::env::current_exe().map_err(|e| format!("Failed to get exe path: {}", e))?;
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     let script = format!(
         "Start-Process -FilePath '{}' -WorkingDirectory '{}' -Verb RunAs",

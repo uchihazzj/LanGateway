@@ -6,6 +6,7 @@ pub struct SettingsPanel {
     pub mdns_hostname: String,
     pub preferred_gateway_ip: String,
     pub interfaces: Vec<InterfaceInfo>,
+    pub config_path: std::path::PathBuf,
 }
 
 impl SettingsPanel {
@@ -14,15 +15,11 @@ impl SettingsPanel {
             mdns_hostname: "gateway".into(),
             preferred_gateway_ip: "auto".into(),
             interfaces: Vec::new(),
+            config_path: std::path::PathBuf::from("C:\\ProgramData\\LanGateway\\config.toml"),
         }
     }
 
-    pub fn show(
-        &mut self,
-        ui: &mut egui::Ui,
-        info: &DashboardInfo,
-        i18n: &mut I18n,
-    ) {
+    pub fn show(&mut self, ui: &mut egui::Ui, info: &DashboardInfo, i18n: &mut I18n) {
         ui.heading(i18n.text("settings.title"));
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -61,10 +58,12 @@ impl SettingsPanel {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             // Auto option
             let _is_auto = self.preferred_gateway_ip == "auto";
-            if ui
-                .radio_value(&mut self.preferred_gateway_ip, "auto".to_string(), i18n.text("settings.auto_select"))
-                .clicked()
-            {}
+            ui.radio_value(
+                &mut self.preferred_gateway_ip,
+                "auto".to_string(),
+                i18n.text("settings.auto_select"),
+            )
+            .clicked();
 
             // List detected IPs — only usable gateway IPs
             let ips: Vec<String> = if !info.local_ipv4.is_empty() {
@@ -175,11 +174,10 @@ impl SettingsPanel {
         // Config section
         ui.strong(i18n.text("settings.config"));
         egui::Frame::group(ui.style()).show(ui, |ui| {
-            let config_path = crate::storage::config::Config::config_path();
             ui.label(format!(
                 "{}: {}",
                 i18n.text("settings.config_file"),
-                config_path.display()
+                self.config_path.display()
             ));
             ui.label(i18n.text("settings.config_format"));
             ui.label(i18n.text("settings.config_desc"));

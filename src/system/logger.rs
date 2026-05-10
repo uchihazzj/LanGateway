@@ -12,7 +12,9 @@ fn log_path() -> PathBuf {
 }
 
 pub fn ensure_log_dir() {
-    let _ = fs::create_dir_all(log_dir());
+    if let Err(e) = fs::create_dir_all(log_dir()) {
+        eprintln!("WARNING: Failed to create log directory: {}", e);
+    }
 }
 
 pub fn log_to_file(msg: &str) {

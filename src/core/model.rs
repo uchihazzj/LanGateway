@@ -26,7 +26,6 @@ pub enum HealthStatus {
     Healthy,
     TargetUnreachable(String),
     MetadataOnly,
-    Unknown,
 }
 
 impl HealthStatus {
@@ -49,10 +48,6 @@ impl HealthStatus {
                 ZhCn => "仅有本地配置",
                 EnUs => "Metadata Only",
             },
-            HealthStatus::Unknown => match lang {
-                ZhCn => "未知",
-                EnUs => "Unknown",
-            },
         }
     }
 
@@ -69,7 +64,6 @@ impl HealthStatus {
             HealthStatus::Healthy => egui::Color32::from_rgb(0, 180, 80),
             HealthStatus::TargetUnreachable(_) => egui::Color32::from_rgb(220, 80, 60),
             HealthStatus::MetadataOnly => egui::Color32::from_rgb(200, 160, 0),
-            HealthStatus::Unknown => egui::Color32::GRAY,
         }
     }
 }
@@ -92,9 +86,11 @@ pub struct InterfaceInfo {
 
 #[derive(Debug, Clone)]
 pub enum RefreshState {
-    Idle,
     Refreshing,
-    Done { at: std::time::Instant, error: Option<String> },
+    Done {
+        at: std::time::Instant,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

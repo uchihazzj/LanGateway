@@ -84,14 +84,9 @@ impl DashboardPanel {
                 need_refresh = true;
             }
 
-            if !info.is_admin {
-                if ui.button(i18n.text("dashboard.restart_as_admin")).clicked() {
-                    match privilege::restart_as_admin() {
-                        Ok(()) => {}
-                        Err(e) => {
-                            self.elevation_error = Some(e);
-                        }
-                    }
+            if !info.is_admin && ui.button(i18n.text("dashboard.restart_as_admin")).clicked() {
+                if let Err(e) = privilege::restart_as_admin() {
+                    self.elevation_error = Some(e);
                 }
             }
         });
@@ -106,7 +101,6 @@ impl DashboardPanel {
 
         ui.add_space(4.0);
         match &info.refresh_state {
-            RefreshState::Idle => {}
             RefreshState::Refreshing => {
                 ui.label("Refreshing...");
             }

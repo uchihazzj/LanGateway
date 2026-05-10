@@ -1,13 +1,15 @@
-use crate::core::model::{HealthStatus, PortproxyEntry, ForwardRule};
+use crate::core::model::{ForwardRule, HealthStatus, PortproxyEntry};
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 pub fn check_tcp(host: &str, port: u16, timeout_ms: u64) -> Result<(), String> {
     let addr_str = format!("{}:{}", host, port);
-    let mut addrs = addr_str.to_socket_addrs()
+    let mut addrs = addr_str
+        .to_socket_addrs()
         .map_err(|e| format!("DNS resolve failed: {}", e))?;
-    let addr = addrs.next()
+    let addr = addrs
+        .next()
         .ok_or_else(|| "No address resolved".to_string())?;
     match TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms)) {
         Ok(_) => Ok(()),

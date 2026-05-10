@@ -20,7 +20,11 @@ pub fn get_active_interfaces() -> Vec<InterfaceInfo> {
         if !ifaces.is_empty() {
             logger::log_to_file(&format!(
                 "PowerShell: got {} interfaces, {} IPs",
-                ifaces.iter().map(|i| i.name.as_str()).collect::<std::collections::HashSet<_>>().len(),
+                ifaces
+                    .iter()
+                    .map(|i| i.name.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
                 ifaces.len()
             ));
             return ifaces;
@@ -44,17 +48,27 @@ fn get_interfaces_via_powershell() -> Option<Vec<InterfaceInfo>> {
 
     logger::log_to_file(&format!(
         "PowerShell IP: exit={}, stdout_len={}, stderr_len={}",
-        ip_output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+        ip_output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".into()),
         ip_output.stdout.len(),
         ip_output.stderr.len()
     ));
     if !ip_output.status.success() {
-        logger::log_to_file(&format!("PowerShell IP stderr: {}", encoding::decode(&ip_output.stderr)));
+        logger::log_to_file(&format!(
+            "PowerShell IP stderr: {}",
+            encoding::decode(&ip_output.stderr)
+        ));
         return None;
     }
 
     let ip_json = encoding::decode(&ip_output.stdout);
-    logger::log_to_file(&format!("PowerShell IP JSON (first 300): {}", &ip_json[..ip_json.len().min(300)]));
+    logger::log_to_file(&format!(
+        "PowerShell IP JSON (first 300): {}",
+        &ip_json[..ip_json.len().min(300)]
+    ));
 
     // Command: Get adapters
     let ad_output = process::run_command(
@@ -67,10 +81,16 @@ fn get_interfaces_via_powershell() -> Option<Vec<InterfaceInfo>> {
 
     let ad_json = if ad_output.status.success() {
         let json = encoding::decode(&ad_output.stdout);
-        logger::log_to_file(&format!("PowerShell Adapter JSON (first 200): {}", &json[..json.len().min(200)]));
+        logger::log_to_file(&format!(
+            "PowerShell Adapter JSON (first 200): {}",
+            &json[..json.len().min(200)]
+        ));
         json
     } else {
-        logger::log_to_file(&format!("PowerShell Adapter stderr: {}", encoding::decode(&ad_output.stderr)));
+        logger::log_to_file(&format!(
+            "PowerShell Adapter stderr: {}",
+            encoding::decode(&ad_output.stderr)
+        ));
         String::new()
     };
 
@@ -96,9 +116,6 @@ struct PsAdapter {
     #[serde(rename = "Name")]
     name: String,
     #[serde(default)]
-    #[serde(rename = "InterfaceDescription")]
-    interface_description: String,
-    #[serde(default)]
     #[serde(rename = "InterfaceIndex")]
     interface_index: i32,
     #[serde(default)]
@@ -119,14 +136,20 @@ fn parse_json_array_or_single<'a, T: Deserialize<'a>>(json: &'a str) -> Option<V
 
 fn parse_powershell_output(ip_json: &str, ad_json: &str) -> Option<Vec<InterfaceInfo>> {
     let ip_addrs = parse_json_array_or_single::<PsIpAddr>(ip_json)?;
-    logger::log_to_file(&format!("PowerShell: parsed {} IP addresses from JSON", ip_addrs.len()));
+    logger::log_to_file(&format!(
+        "PowerShell: parsed {} IP addresses from JSON",
+        ip_addrs.len()
+    ));
 
     let adapters: Vec<PsAdapter> = if ad_json.is_empty() {
         Vec::new()
     } else {
         parse_json_array_or_single::<PsAdapter>(ad_json).unwrap_or_default()
     };
-    logger::log_to_file(&format!("PowerShell: parsed {} adapters from JSON", adapters.len()));
+    logger::log_to_file(&format!(
+        "PowerShell: parsed {} adapters from JSON",
+        adapters.len()
+    ));
 
     let mut interfaces = Vec::new();
 
@@ -138,7 +161,9 @@ fn parse_powershell_output(ip_json: &str, ad_json: &str) -> Option<Vec<Interface
 
         // Find matching adapter by InterfaceIndex
         let adapter = if ip.interface_index != 0 {
-            adapters.iter().find(|a| a.interface_index == ip.interface_index)
+            adapters
+                .iter()
+                .find(|a| a.interface_index == ip.interface_index)
         } else {
             None
         };
@@ -149,7 +174,10 @@ fn parse_powershell_output(ip_json: &str, ad_json: &str) -> Option<Vec<Interface
             Some(ad) if !ad.name.is_empty() => ad.name.clone(),
             _ if !ip.interface_alias.is_empty() => ip.interface_alias.clone(),
             _ => {
-                logger::log_to_file(&format!("  IP {}: no adapter name found (index={})", ip.ip_address, ip.interface_index));
+                logger::log_to_file(&format!(
+                    "  IP {}: no adapter name found (index={})",
+                    ip.ip_address, ip.interface_index
+                ));
                 continue;
             }
         };
@@ -219,14 +247,19 @@ fn get_interfaces_via_ipconfig() -> Vec<InterfaceInfo> {
             current_ipv4.clear();
             current_mac.clear();
         } else if trimmed.starts_with("IPv4 Address") || trimmed.contains("IPv4 地址") {
-            if let Some(addr) = trimmed.split(':').last() {
-                let addr = addr.trim().replace("(Preferred)", "").replace("(首选)", "").trim().to_string();
+            if let Some(addr) = trimmed.split(':').next_back() {
+                let addr = addr
+                    .trim()
+                    .replace("(Preferred)", "")
+                    .replace("(首选)", "")
+                    .trim()
+                    .to_string();
                 if !addr.is_empty() {
                     current_ipv4 = addr;
                 }
             }
         } else if trimmed.starts_with("Physical Address") || trimmed.contains("物理地址") {
-            if let Some(addr) = trimmed.split(':').last() {
+            if let Some(addr) = trimmed.split(':').next_back() {
                 current_mac = addr.trim().to_string();
             }
         }
@@ -256,25 +289,43 @@ pub fn ipv4_addresses_from(interfaces: &[InterfaceInfo]) -> Vec<String> {
 
 pub fn is_apipa_ipv4(ip: &str) -> bool {
     ip.parse::<Ipv4Addr>()
-        .map(|a| { let o = a.octets(); o[0] == 169 && o[1] == 254 })
+        .map(|a| {
+            let o = a.octets();
+            o[0] == 169 && o[1] == 254
+        })
         .unwrap_or(false)
 }
 
 pub fn is_benchmark_ipv4(ip: &str) -> bool {
     ip.parse::<Ipv4Addr>()
-        .map(|a| { let o = a.octets(); o[0] == 198 && (o[1] == 18 || o[1] == 19) })
+        .map(|a| {
+            let o = a.octets();
+            o[0] == 198 && (o[1] == 18 || o[1] == 19)
+        })
         .unwrap_or(false)
 }
 
 pub fn is_usable_gateway_ipv4(ip: &str) -> bool {
     if let Ok(addr) = ip.parse::<Ipv4Addr>() {
         let o = addr.octets();
-        if o == [0, 0, 0, 0] { return false; }
-        if o[0] == 127 { return false; }
-        if o[0] == 169 && o[1] == 254 { return false; }
-        if o[0] == 198 && (o[1] == 18 || o[1] == 19) { return false; }
-        if o[0] >= 224 { return false; }
-        if o == [255, 255, 255, 255] { return false; }
+        if o == [0, 0, 0, 0] {
+            return false;
+        }
+        if o[0] == 127 {
+            return false;
+        }
+        if o[0] == 169 && o[1] == 254 {
+            return false;
+        }
+        if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+            return false;
+        }
+        if o[0] >= 224 {
+            return false;
+        }
+        if o == [255, 255, 255, 255] {
+            return false;
+        }
         true
     } else {
         false
@@ -284,9 +335,15 @@ pub fn is_usable_gateway_ipv4(ip: &str) -> bool {
 pub fn gateway_ip_priority(ip: &str) -> u8 {
     if let Ok(addr) = ip.parse::<Ipv4Addr>() {
         let o = addr.octets();
-        if o[0] == 10 { return 1; }
-        if o[0] == 172 && (16..=31).contains(&o[1]) { return 2; }
-        if o[0] == 192 && o[1] == 168 { return 3; }
+        if o[0] == 10 {
+            return 1;
+        }
+        if o[0] == 172 && (16..=31).contains(&o[1]) {
+            return 2;
+        }
+        if o[0] == 192 && o[1] == 168 {
+            return 3;
+        }
         return 4;
     }
     5
@@ -304,11 +361,33 @@ pub fn usable_gateway_ipv4_addresses(interfaces: &[InterfaceInfo]) -> Vec<String
 pub fn is_virtual_adapter(name: &str) -> bool {
     let lower = name.to_lowercase();
     let keywords = [
-        "hyper-v", "wsl", "docker", "vpn", "virtual", "tun", "tap",
-        "clash", "vethernet", "vmware", "virtualbox", "tailscale",
-        "zerotier", "wireguard", "pangp", "sangfor", "easyconnect",
-        "loopback", "pseudo", "tunnel", "6to4", "teredo", "isatap",
-        "bluetooth", "wan miniport", "vbox", "host-only",
+        "hyper-v",
+        "wsl",
+        "docker",
+        "vpn",
+        "virtual",
+        "tun",
+        "tap",
+        "clash",
+        "vethernet",
+        "vmware",
+        "virtualbox",
+        "tailscale",
+        "zerotier",
+        "wireguard",
+        "pangp",
+        "sangfor",
+        "easyconnect",
+        "loopback",
+        "pseudo",
+        "tunnel",
+        "6to4",
+        "teredo",
+        "isatap",
+        "bluetooth",
+        "wan miniport",
+        "vbox",
+        "host-only",
     ];
     keywords.iter().any(|k| lower.contains(k))
 }
@@ -322,10 +401,16 @@ pub fn select_preferred_ip(
 ) -> String {
     if preferred != "auto" && !preferred.is_empty() {
         if ipv4s.iter().any(|ip| ip == preferred) {
-            logger::log_to_file(&format!("select_preferred_ip: manual override -> {}", preferred));
+            logger::log_to_file(&format!(
+                "select_preferred_ip: manual override -> {}",
+                preferred
+            ));
             return preferred.to_string();
         }
-        logger::log_to_file(&format!("select_preferred_ip: manual '{}' not found, falling back to auto", preferred));
+        logger::log_to_file(&format!(
+            "select_preferred_ip: manual '{}' not found, falling back to auto",
+            preferred
+        ));
     }
 
     let candidates: Vec<&String> = ipv4s
@@ -333,7 +418,11 @@ pub fn select_preferred_ip(
         .filter(|ip| is_usable_gateway_ipv4(ip))
         .collect();
 
-    logger::log_to_file(&format!("select_preferred_ip: {} total, {} candidates after filter", ipv4s.len(), candidates.len()));
+    logger::log_to_file(&format!(
+        "select_preferred_ip: {} total, {} candidates after filter",
+        ipv4s.len(),
+        candidates.len()
+    ));
 
     if candidates.is_empty() {
         logger::log_to_file("select_preferred_ip: no candidates, returning empty");
@@ -341,7 +430,7 @@ pub fn select_preferred_ip(
     }
 
     fn is_lan_ip(ip: &str) -> bool {
-        matches!(gateway_ip_priority(ip), 1 | 2 | 3)
+        matches!(gateway_ip_priority(ip), 1..=3)
     }
 
     let mut best: Option<&String> = None;
@@ -350,7 +439,10 @@ pub fn select_preferred_ip(
         let iface = interfaces.iter().find(|i| &i.ipv4 == *ip);
         if is_lan_ip(ip) && iface.map(|i| !i.is_virtual).unwrap_or(true) {
             let p = gateway_ip_priority(ip);
-            if p < best_prio { best_prio = p; best = Some(ip); }
+            if p < best_prio {
+                best_prio = p;
+                best = Some(ip);
+            }
         }
     }
     if let Some(ip) = best {
@@ -379,8 +471,12 @@ pub fn select_preferred_ip(
 }
 
 pub fn get_interface_for_ip<'a>(ip: &str, interfaces: &'a [InterfaceInfo]) -> &'a str {
-    if ip.is_empty() { return "Unknown"; }
-    interfaces.iter().find(|i| i.ipv4 == ip)
+    if ip.is_empty() {
+        return "Unknown";
+    }
+    interfaces
+        .iter()
+        .find(|i| i.ipv4 == ip)
         .map(|i| i.name.as_str())
         .unwrap_or("Unknown")
 }
@@ -390,7 +486,12 @@ mod tests {
     use super::*;
 
     fn make_iface(name: &str, ip: &str, is_virtual: bool) -> InterfaceInfo {
-        InterfaceInfo { name: name.into(), ipv4: ip.into(), mac: String::new(), is_virtual }
+        InterfaceInfo {
+            name: name.into(),
+            ipv4: ip.into(),
+            mac: String::new(),
+            is_virtual,
+        }
     }
 
     // --- JSON parsing ---
@@ -491,7 +592,11 @@ mod tests {
 
     #[test]
     fn select_preferred_ip_prioritizes_lan() {
-        let ips = vec!["198.18.0.1".to_string(), "192.168.100.6".to_string(), "10.108.18.68".to_string()];
+        let ips = vec![
+            "198.18.0.1".to_string(),
+            "192.168.100.6".to_string(),
+            "10.108.18.68".to_string(),
+        ];
         let ifaces = vec![
             make_iface("TUN", "198.18.0.1", true),
             make_iface("Wi-Fi", "192.168.100.6", false),
@@ -502,30 +607,62 @@ mod tests {
 
     #[test]
     fn select_preferred_ip_excludes_apipa() {
-        assert_eq!(select_preferred_ip(&["169.254.1.1".into(), "10.0.0.1".into()], "auto", &[make_iface("Ethernet", "10.0.0.1", false)]), "10.0.0.1");
+        assert_eq!(
+            select_preferred_ip(
+                &["169.254.1.1".into(), "10.0.0.1".into()],
+                "auto",
+                &[make_iface("Ethernet", "10.0.0.1", false)]
+            ),
+            "10.0.0.1"
+        );
     }
 
     #[test]
     fn select_preferred_ip_excludes_198_18_and_198_19() {
-        let ips = vec!["169.254.1.2".into(), "198.18.0.1".into(), "198.19.0.1".into(), "192.168.100.6".into(), "10.108.18.68".into()];
-        let result = select_preferred_ip(&ips, "auto", &[make_iface("Ethernet", "10.108.18.68", false)]);
+        let ips = vec![
+            "169.254.1.2".into(),
+            "198.18.0.1".into(),
+            "198.19.0.1".into(),
+            "192.168.100.6".into(),
+            "10.108.18.68".into(),
+        ];
+        let result = select_preferred_ip(
+            &ips,
+            "auto",
+            &[make_iface("Ethernet", "10.108.18.68", false)],
+        );
         assert_eq!(result, "10.108.18.68");
     }
 
     #[test]
     fn select_preferred_ip_all_apipa_returns_empty() {
-        let result = select_preferred_ip(&["169.254.1.2".into(), "169.254.200.1".into()], "auto", &[]);
+        let result =
+            select_preferred_ip(&["169.254.1.2".into(), "169.254.200.1".into()], "auto", &[]);
         assert_eq!(result, "");
     }
 
     #[test]
     fn select_preferred_ip_manual_override() {
-        assert_eq!(select_preferred_ip(&["10.0.0.1".into(), "192.168.1.1".into()], "192.168.1.1", &[]), "192.168.1.1");
+        assert_eq!(
+            select_preferred_ip(
+                &["10.0.0.1".into(), "192.168.1.1".into()],
+                "192.168.1.1",
+                &[]
+            ),
+            "192.168.1.1"
+        );
     }
 
     #[test]
     fn select_preferred_ip_manual_missing_falls_back() {
-        assert_eq!(select_preferred_ip(&["10.0.0.1".into()], "10.99.99.99", &[make_iface("Ethernet", "10.0.0.1", false)]), "10.0.0.1");
+        assert_eq!(
+            select_preferred_ip(
+                &["10.0.0.1".into()],
+                "10.99.99.99",
+                &[make_iface("Ethernet", "10.0.0.1", false)]
+            ),
+            "10.0.0.1"
+        );
     }
 
     #[test]
@@ -535,12 +672,23 @@ mod tests {
 
     #[test]
     fn select_preferred_ip_excludes_zeros() {
-        assert_eq!(select_preferred_ip(&["0.0.0.0".into(), "127.0.0.1".into(), "10.0.0.1".into()], "auto", &[make_iface("Ethernet", "10.0.0.1", false)]), "10.0.0.1");
+        assert_eq!(
+            select_preferred_ip(
+                &["0.0.0.0".into(), "127.0.0.1".into(), "10.0.0.1".into()],
+                "auto",
+                &[make_iface("Ethernet", "10.0.0.1", false)]
+            ),
+            "10.0.0.1"
+        );
     }
 
     #[test]
     fn select_preferred_ip_excludes_multicast() {
-        let result = select_preferred_ip(&["224.0.0.1".into(), "10.0.0.1".into()], "auto", &[make_iface("Ethernet", "10.0.0.1", false)]);
+        let result = select_preferred_ip(
+            &["224.0.0.1".into(), "10.0.0.1".into()],
+            "auto",
+            &[make_iface("Ethernet", "10.0.0.1", false)],
+        );
         assert_eq!(result, "10.0.0.1");
     }
 

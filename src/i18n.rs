@@ -53,7 +53,9 @@ fn zh_cn(key: &str) -> &str {
         "dashboard.refresh_status" => "刷新状态",
         "dashboard.refresh_hint" => "点击刷新以重新加载 PortProxy 规则和网络信息。",
         "dashboard.restart_as_admin" => "以管理员身份重启",
-        "dashboard.read_only_hint" => "当前为只读模式，新增、删除和修改 PortProxy 规则需要管理员权限。",
+        "dashboard.read_only_hint" => {
+            "当前为只读模式，新增、删除和修改 PortProxy 规则需要管理员权限。"
+        }
         "dashboard.run_health_check" => "运行健康检查",
         "dashboard.add_rule_hint" => "可在转发规则页面新增 PortProxy 规则",
         "dashboard.elevation_failed" => "提权失败",
@@ -63,6 +65,7 @@ fn zh_cn(key: &str) -> &str {
         "rules.no_managed" => "尚无已管理规则，请在下方添加。",
         "rules.orphan" => "未接管规则 (不在本地配置中)",
         "rules.add_new" => "新增规则",
+        "rules.edit_rule" => "编辑规则",
         "rules.refresh" => "刷新规则",
         "col.name" => "名称",
         "col.listen_addr" => "监听地址",
@@ -112,6 +115,17 @@ fn zh_cn(key: &str) -> &str {
         "settings.adapter_list" => "网卡列表",
         "settings.suspected_virtual" => "疑似虚拟网卡",
         "settings.apipa_warning" => "APIPA / 不适合作为 Gateway IP",
+        "btn.adopt" => "接管",
+        "btn.adopt_all" => "接管全部",
+        "btn.edit" => "编辑",
+        "btn.update_rule" => "更新规则",
+        "btn.cancel_edit" => "取消编辑",
+        "msg.orphan_adopted" => "已接管选中的规则。",
+        "msg.orphans_adopted" => "已接管 {count} 条规则。",
+        "msg.adopt_failed" => "接管失败",
+        "msg.rule_updated" => "规则更新成功。",
+        "msg.config_save_failed" => "写入配置文件失败",
+        "status.initializing" => "正在初始化...",
         _ => key,
     }
 }
@@ -154,6 +168,7 @@ fn en_us(key: &str) -> &str {
         "rules.no_managed" => "No managed rules. Add one below.",
         "rules.orphan" => "Orphan Rules (not in local config)",
         "rules.add_new" => "Add New Rule",
+        "rules.edit_rule" => "Edit Rule",
         "rules.refresh" => "Refresh Rules",
         "col.name" => "Name",
         "col.listen_addr" => "Listen Addr",
@@ -203,6 +218,17 @@ fn en_us(key: &str) -> &str {
         "settings.adapter_list" => "Adapter List",
         "settings.suspected_virtual" => "Suspected virtual adapter",
         "settings.apipa_warning" => "APIPA / Not suitable as Gateway IP",
+        "btn.adopt" => "Adopt",
+        "btn.adopt_all" => "Adopt All",
+        "btn.edit" => "Edit",
+        "btn.update_rule" => "Update Rule",
+        "btn.cancel_edit" => "Cancel",
+        "msg.orphan_adopted" => "Orphan rule adopted.",
+        "msg.orphans_adopted" => "Adopted {count} orphan rules.",
+        "msg.adopt_failed" => "Adoption failed",
+        "msg.rule_updated" => "Rule updated successfully.",
+        "msg.config_save_failed" => "Failed to write config file",
+        "status.initializing" => "Initializing...",
         _ => key,
     }
 }
