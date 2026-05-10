@@ -1,5 +1,6 @@
 use crate::core::model::{DashboardInfo, InterfaceInfo, Language};
 use crate::i18n::I18n;
+use crate::system::network;
 
 pub struct SettingsPanel {
     pub mdns_hostname: String,
@@ -65,11 +66,13 @@ impl SettingsPanel {
                 .clicked()
             {}
 
-            // List detected IPs
+            // List detected IPs — only usable gateway IPs
             let ips: Vec<String> = if !info.local_ipv4.is_empty() {
                 info.local_ipv4.clone()
             } else {
-                self.interfaces.iter().map(|i| i.ipv4.clone()).collect()
+                self.interfaces.iter().map(|i| i.ipv4.clone())
+                    .filter(|ip| network::is_usable_gateway_ipv4(ip))
+                    .collect()
             };
 
             for ip in &ips {
@@ -109,9 +112,14 @@ impl SettingsPanel {
                 } else {
                     String::new()
                 };
+                let apipa_tag = if network::is_apipa_ipv4(&iface.ipv4) {
+                    format!(" [{}]", i18n.text("settings.apipa_warning"))
+                } else {
+                    String::new()
+                };
                 ui.label(format!(
-                    "{}  |  IPv4: {}  |  MAC: {}{}",
-                    iface.name, iface.ipv4, iface.mac, vtag
+                    "{}  |  IPv4: {}  |  MAC: {}{}{}",
+                    iface.name, iface.ipv4, iface.mac, vtag, apipa_tag
                 ));
             }
             if info.interfaces.is_empty() {
@@ -177,6 +185,7 @@ impl SettingsPanel {
             ui.label(i18n.text("settings.config_desc"));
         });
 
+            ui.add_space(24.0);
         }); // ScrollArea
     }
 }

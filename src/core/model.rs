@@ -97,6 +97,25 @@ pub enum RefreshState {
     Done { at: std::time::Instant, error: Option<String> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OrphanKey {
+    pub listen_address: String,
+    pub listen_port: u16,
+    pub connect_address: String,
+    pub connect_port: u16,
+}
+
+impl OrphanKey {
+    pub fn from_entry(entry: &PortproxyEntry) -> Self {
+        Self {
+            listen_address: entry.listen_address.clone(),
+            listen_port: entry.listen_port,
+            connect_address: entry.connect_address.clone(),
+            connect_port: entry.connect_port,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DashboardInfo {
     pub hostname: String,

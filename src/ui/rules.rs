@@ -1,18 +1,24 @@
 use crate::core::health;
-use crate::core::model::{ForwardRule, HealthStatus, PortproxyEntry};
+use crate::core::model::{ForwardRule, HealthStatus, OrphanKey, PortproxyEntry};
 use crate::i18n::I18n;
 use crate::storage::config::Config;
 use crate::system::portproxy;
+
+pub struct HealthCheckResult {
+    pub health_map: std::collections::HashMap<usize, HealthStatus>,
+    pub orphan_health: std::collections::HashMap<OrphanKey, HealthStatus>,
+}
 
 pub struct RulesPanel {
     pub config: Config,
     pub config_path: std::path::PathBuf,
     pub proxy_entries: Vec<PortproxyEntry>,
     pub health_map: std::collections::HashMap<usize, HealthStatus>,
-    pub orphan_health: std::collections::HashMap<usize, HealthStatus>,
+    pub orphan_health: std::collections::HashMap<OrphanKey, HealthStatus>,
     pub status_message: String,
     pub is_admin: bool,
     pub health_check_running: bool,
+    pub health_result_rx: Option<std::sync::mpsc::Receiver<HealthCheckResult>>,
 
     pub add_listen_port: String,
     pub add_connect_address: String,
@@ -32,6 +38,7 @@ impl RulesPanel {
             status_message: String::new(),
             is_admin,
             health_check_running: false,
+            health_result_rx: None,
             add_listen_port: String::new(),
             add_connect_address: String::new(),
             add_connect_port: String::new(),
@@ -68,6 +75,9 @@ impl RulesPanel {
         let rules: Vec<_> = self.config.rules.clone();
         let proxy_entries: Vec<_> = self.proxy_entries.clone();
 
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.health_result_rx = Some(rx);
+
         std::thread::spawn(move || {
             let mut health_map = std::collections::HashMap::new();
             for (i, rule) in rules.iter().enumerate() {
@@ -80,6 +90,7 @@ impl RulesPanel {
                 .filter(|e| {
                     !rules.iter().any(|r| {
                         r.listen_port == e.listen_port
+                            && r.listen_address == e.listen_address
                             && r.connect_address == e.connect_address
                             && r.connect_port == e.connect_port
                     })
@@ -88,26 +99,24 @@ impl RulesPanel {
                 .collect();
 
             let mut orphan_health = std::collections::HashMap::new();
-            for (i, entry) in orphans.iter().enumerate() {
-                orphan_health.insert(i, health::check_orphan(entry));
+            for entry in &orphans {
+                let key = OrphanKey::from_entry(entry);
+                orphan_health.insert(key, health::check_orphan(entry));
             }
 
-            // Results are applied in the next call to apply_health_results
-            // We use a simple approach: pass results through a static
-            PENDING_HEALTH.with(|cell| {
-                cell.replace(Some((health_map, orphan_health)));
-            });
+            let _ = tx.send(HealthCheckResult { health_map, orphan_health });
         });
     }
 
     pub fn apply_health_results(&mut self) {
-        PENDING_HEALTH.with(|cell| {
-            if let Some((health_map, orphan_health)) = cell.take() {
-                self.health_map = health_map;
-                self.orphan_health = orphan_health;
+        if let Some(rx) = &self.health_result_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.health_map = result.health_map;
+                self.orphan_health = result.orphan_health;
                 self.health_check_running = false;
+                self.health_result_rx = None;
             }
-        });
+        }
     }
 
     pub fn orphan_entries(&self) -> Vec<&PortproxyEntry> {
@@ -116,6 +125,7 @@ impl RulesPanel {
             .filter(|e| {
                 !self.config.rules.iter().any(|r| {
                     r.listen_port == e.listen_port
+                        && r.listen_address == e.listen_address
                         && r.connect_address == e.connect_address
                         && r.connect_port == e.connect_port
                 })
@@ -285,7 +295,7 @@ impl RulesPanel {
                             ui.colored_label(
                                 health.color(),
                                 health.label(self.config.language),
-                            );
+                            ).on_hover_text(health.detail());
 
                             if ui
                                 .add_enabled(
@@ -339,14 +349,15 @@ impl RulesPanel {
                             ui.label(&entry.connect_address);
                             ui.label(entry.connect_port.to_string());
 
+                            let key = OrphanKey::from_entry(entry);
                             let status = self
                                 .orphan_health
-                                .get(&i)
+                                .get(&key)
                                 .unwrap_or(&HealthStatus::NotChecked);
                             ui.colored_label(
                                 status.color(),
                                 status.label(self.config.language),
-                            );
+                            ).on_hover_text(status.detail());
 
                             if ui
                                 .add_enabled(
@@ -438,11 +449,4 @@ impl RulesPanel {
             }
         });
     }
-}
-
-// Thread-local storage for background health check results
-use std::cell::RefCell;
-thread_local! {
-    static PENDING_HEALTH: RefCell<Option<(std::collections::HashMap<usize, HealthStatus>, std::collections::HashMap<usize, HealthStatus>)>> =
-        RefCell::new(None);
 }

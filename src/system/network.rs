@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use crate::core::model::InterfaceInfo;
 use crate::system::{encoding, logger, process};
 use serde::Deserialize;
@@ -141,6 +143,8 @@ fn parse_powershell_output(ip_json: &str, ad_json: &str) -> Option<Vec<Interface
             None
         };
 
+        let mac = adapter.map(|a| a.mac_address.clone()).unwrap_or_default();
+
         let name = match adapter {
             Some(ad) if !ad.name.is_empty() => ad.name.clone(),
             _ if !ip.interface_alias.is_empty() => ip.interface_alias.clone(),
@@ -150,18 +154,18 @@ fn parse_powershell_output(ip_json: &str, ad_json: &str) -> Option<Vec<Interface
             }
         };
 
-        let mac = adapter.map(|a| a.mac_address.clone()).unwrap_or_default();
+        let is_virt = is_virtual_adapter(&name);
 
         logger::log_to_file(&format!(
             "  IP {} -> adapter '{}' (idx={}, virtual={}, mac={})",
-            ip.ip_address, name, ip.interface_index, is_virtual_adapter(&name), mac
+            ip.ip_address, name, ip.interface_index, is_virt, mac
         ));
 
         interfaces.push(InterfaceInfo {
             name,
             ipv4: ip.ip_address.clone(),
             mac,
-            is_virtual: is_virtual_adapter(&ip.interface_alias),
+            is_virtual: is_virt,
         });
     }
 
@@ -250,6 +254,53 @@ pub fn ipv4_addresses_from(interfaces: &[InterfaceInfo]) -> Vec<String> {
         .collect()
 }
 
+pub fn is_apipa_ipv4(ip: &str) -> bool {
+    ip.parse::<Ipv4Addr>()
+        .map(|a| { let o = a.octets(); o[0] == 169 && o[1] == 254 })
+        .unwrap_or(false)
+}
+
+pub fn is_benchmark_ipv4(ip: &str) -> bool {
+    ip.parse::<Ipv4Addr>()
+        .map(|a| { let o = a.octets(); o[0] == 198 && (o[1] == 18 || o[1] == 19) })
+        .unwrap_or(false)
+}
+
+pub fn is_usable_gateway_ipv4(ip: &str) -> bool {
+    if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+        let o = addr.octets();
+        if o == [0, 0, 0, 0] { return false; }
+        if o[0] == 127 { return false; }
+        if o[0] == 169 && o[1] == 254 { return false; }
+        if o[0] == 198 && (o[1] == 18 || o[1] == 19) { return false; }
+        if o[0] >= 224 { return false; }
+        if o == [255, 255, 255, 255] { return false; }
+        true
+    } else {
+        false
+    }
+}
+
+pub fn gateway_ip_priority(ip: &str) -> u8 {
+    if let Ok(addr) = ip.parse::<Ipv4Addr>() {
+        let o = addr.octets();
+        if o[0] == 10 { return 1; }
+        if o[0] == 172 && (16..=31).contains(&o[1]) { return 2; }
+        if o[0] == 192 && o[1] == 168 { return 3; }
+        return 4;
+    }
+    5
+}
+
+pub fn usable_gateway_ipv4_addresses(interfaces: &[InterfaceInfo]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    interfaces
+        .iter()
+        .map(|i| i.ipv4.clone())
+        .filter(|ip| is_usable_gateway_ipv4(ip) && seen.insert(ip.clone()))
+        .collect()
+}
+
 pub fn is_virtual_adapter(name: &str) -> bool {
     let lower = name.to_lowercase();
     let keywords = [
@@ -279,13 +330,7 @@ pub fn select_preferred_ip(
 
     let candidates: Vec<&String> = ipv4s
         .iter()
-        .filter(|ip| {
-            let ip = ip.as_str();
-            !ip.starts_with("127.")
-                && !ip.starts_with("169.254.")
-                && !ip.starts_with("198.18.")
-                && ip != "0.0.0.0"
-        })
+        .filter(|ip| is_usable_gateway_ipv4(ip))
         .collect();
 
     logger::log_to_file(&format!("select_preferred_ip: {} total, {} candidates after filter", ipv4s.len(), candidates.len()));
@@ -296,28 +341,7 @@ pub fn select_preferred_ip(
     }
 
     fn is_lan_ip(ip: &str) -> bool {
-        ip.starts_with("10.")
-            || ip.starts_with("192.168.")
-            || {
-                ip.starts_with("172.")
-                    && ip
-                        .split('.')
-                        .nth(1)
-                        .and_then(|s| s.parse::<u8>().ok())
-                        .map(|n| (16..=31).contains(&n))
-                        .unwrap_or(false)
-            }
-    }
-
-    fn lan_priority(ip: &str) -> u8 {
-        if ip.starts_with("10.") { return 1; }
-        if ip.starts_with("172.") {
-            if let Some(n) = ip.split('.').nth(1).and_then(|s| s.parse::<u8>().ok()) {
-                if (16..=31).contains(&n) { return 2; }
-            }
-        }
-        if ip.starts_with("192.168.") { return 3; }
-        4
+        matches!(gateway_ip_priority(ip), 1 | 2 | 3)
     }
 
     let mut best: Option<&String> = None;
@@ -325,7 +349,7 @@ pub fn select_preferred_ip(
     for ip in &candidates {
         let iface = interfaces.iter().find(|i| &i.ipv4 == *ip);
         if is_lan_ip(ip) && iface.map(|i| !i.is_virtual).unwrap_or(true) {
-            let p = lan_priority(ip);
+            let p = gateway_ip_priority(ip);
             if p < best_prio { best_prio = p; best = Some(ip); }
         }
     }
@@ -369,6 +393,8 @@ mod tests {
         InterfaceInfo { name: name.into(), ipv4: ip.into(), mac: String::new(), is_virtual }
     }
 
+    // --- JSON parsing ---
+
     #[test]
     fn parse_single_object_json() {
         let json = r#"{"InterfaceAlias":"Ethernet","InterfaceIndex":12,"IPAddress":"10.0.0.1"}"#;
@@ -403,6 +429,66 @@ mod tests {
         assert_eq!(result[0].mac, "AA-BB-CC-DD-EE-FF");
     }
 
+    // --- IP classification ---
+
+    #[test]
+    fn apipa_ipv4_is_detected() {
+        assert!(is_apipa_ipv4("169.254.1.2"));
+        assert!(is_apipa_ipv4("169.254.0.1"));
+        assert!(!is_apipa_ipv4("169.253.1.1"));
+        assert!(!is_apipa_ipv4("10.0.0.1"));
+    }
+
+    #[test]
+    fn benchmark_ipv4_is_detected() {
+        assert!(is_benchmark_ipv4("198.18.0.1"));
+        assert!(is_benchmark_ipv4("198.18.255.255"));
+        assert!(is_benchmark_ipv4("198.19.0.1"));
+        assert!(is_benchmark_ipv4("198.19.255.255"));
+        assert!(!is_benchmark_ipv4("198.17.0.1"));
+        assert!(!is_benchmark_ipv4("198.20.0.1"));
+        assert!(!is_benchmark_ipv4("10.0.0.1"));
+    }
+
+    #[test]
+    fn usable_gateway_ipv4_filters_specials() {
+        assert!(is_usable_gateway_ipv4("10.0.0.1"));
+        assert!(is_usable_gateway_ipv4("172.16.0.1"));
+        assert!(is_usable_gateway_ipv4("192.168.1.1"));
+        assert!(is_usable_gateway_ipv4("100.64.0.1"));
+        assert!(!is_usable_gateway_ipv4("0.0.0.0"));
+        assert!(!is_usable_gateway_ipv4("127.0.0.1"));
+        assert!(!is_usable_gateway_ipv4("169.254.1.2"));
+        assert!(!is_usable_gateway_ipv4("198.18.0.1"));
+        assert!(!is_usable_gateway_ipv4("198.19.0.1"));
+        assert!(!is_usable_gateway_ipv4("224.0.0.1"));
+        assert!(!is_usable_gateway_ipv4("255.255.255.255"));
+    }
+
+    #[test]
+    fn gateway_ip_priority_order() {
+        assert_eq!(gateway_ip_priority("10.0.0.1"), 1);
+        assert_eq!(gateway_ip_priority("172.16.0.1"), 2);
+        assert_eq!(gateway_ip_priority("172.31.255.255"), 2);
+        assert_eq!(gateway_ip_priority("172.15.0.1"), 4); // not 172.16/12
+        assert_eq!(gateway_ip_priority("192.168.1.1"), 3);
+        assert_eq!(gateway_ip_priority("100.64.0.1"), 4);
+        assert_eq!(gateway_ip_priority("invalid"), 5);
+    }
+
+    #[test]
+    fn usable_gateway_ipv4_addresses_filters_apipa() {
+        let ifaces = vec![
+            make_iface("Ethernet1", "169.254.1.2", false),
+            make_iface("Ethernet2", "10.0.0.1", false),
+        ];
+        let usable = usable_gateway_ipv4_addresses(&ifaces);
+        assert!(!usable.contains(&"169.254.1.2".to_string()));
+        assert!(usable.contains(&"10.0.0.1".to_string()));
+    }
+
+    // --- Preferred IP selection ---
+
     #[test]
     fn select_preferred_ip_prioritizes_lan() {
         let ips = vec!["198.18.0.1".to_string(), "192.168.100.6".to_string(), "10.108.18.68".to_string()];
@@ -417,6 +503,19 @@ mod tests {
     #[test]
     fn select_preferred_ip_excludes_apipa() {
         assert_eq!(select_preferred_ip(&["169.254.1.1".into(), "10.0.0.1".into()], "auto", &[make_iface("Ethernet", "10.0.0.1", false)]), "10.0.0.1");
+    }
+
+    #[test]
+    fn select_preferred_ip_excludes_198_18_and_198_19() {
+        let ips = vec!["169.254.1.2".into(), "198.18.0.1".into(), "198.19.0.1".into(), "192.168.100.6".into(), "10.108.18.68".into()];
+        let result = select_preferred_ip(&ips, "auto", &[make_iface("Ethernet", "10.108.18.68", false)]);
+        assert_eq!(result, "10.108.18.68");
+    }
+
+    #[test]
+    fn select_preferred_ip_all_apipa_returns_empty() {
+        let result = select_preferred_ip(&["169.254.1.2".into(), "169.254.200.1".into()], "auto", &[]);
+        assert_eq!(result, "");
     }
 
     #[test]
@@ -437,6 +536,12 @@ mod tests {
     #[test]
     fn select_preferred_ip_excludes_zeros() {
         assert_eq!(select_preferred_ip(&["0.0.0.0".into(), "127.0.0.1".into(), "10.0.0.1".into()], "auto", &[make_iface("Ethernet", "10.0.0.1", false)]), "10.0.0.1");
+    }
+
+    #[test]
+    fn select_preferred_ip_excludes_multicast() {
+        let result = select_preferred_ip(&["224.0.0.1".into(), "10.0.0.1".into()], "auto", &[make_iface("Ethernet", "10.0.0.1", false)]);
+        assert_eq!(result, "10.0.0.1");
     }
 
     #[test]

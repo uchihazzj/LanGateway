@@ -111,6 +111,7 @@ fn zh_cn(key: &str) -> &str {
         "settings.auto_select" => "自动选择",
         "settings.adapter_list" => "网卡列表",
         "settings.suspected_virtual" => "疑似虚拟网卡",
+        "settings.apipa_warning" => "APIPA / 不适合作为 Gateway IP",
         _ => key,
     }
 }
@@ -201,6 +202,7 @@ fn en_us(key: &str) -> &str {
         "settings.auto_select" => "Auto",
         "settings.adapter_list" => "Adapter List",
         "settings.suspected_virtual" => "Suspected virtual adapter",
+        "settings.apipa_warning" => "APIPA / Not suitable as Gateway IP",
         _ => key,
     }
 }

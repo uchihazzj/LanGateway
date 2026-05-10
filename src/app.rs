@@ -65,6 +65,7 @@ impl LanGatewayApp {
         let hostname = network::get_hostname().unwrap_or_else(|| "unknown".into());
         let interfaces = network::get_active_interfaces();
         let ipv4s = network::ipv4_addresses_from(&interfaces);
+        let usable_ipv4s = network::usable_gateway_ipv4_addresses(&interfaces);
         let proxy_entries = portproxy::show_all().unwrap_or_default();
 
         let gateway_ip = network::select_preferred_ip(
@@ -81,7 +82,7 @@ impl LanGatewayApp {
 
         DashboardInfo {
             hostname,
-            local_ipv4: ipv4s,
+            local_ipv4: usable_ipv4s,
             active_interface,
             is_admin,
             rule_count: proxy_entries.len(),
@@ -191,33 +192,7 @@ impl eframe::App for LanGatewayApp {
                 self.sidebar(ui);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.tab {
-                Tab::Dashboard => {
-                    if self.dashboard.show(ui, &self.dashboard_info, &self.i18n) {
-                        self.start_background_refresh();
-                    }
-                }
-                Tab::Rules => {
-                    self.rules_panel.show(ui, &self.i18n);
-                }
-                Tab::Settings => {
-                    let prev_lang = self.i18n.language();
-                    let prev_ip = self.settings_panel.preferred_gateway_ip.clone();
-                    self.settings_panel
-                        .show(ui, &self.dashboard_info, &mut self.i18n);
-                    if self.i18n.language() != prev_lang {
-                        self.on_language_changed(self.i18n.language());
-                    }
-                    if self.settings_panel.preferred_gateway_ip != prev_ip {
-                        self.save_config_deferred();
-                        // Lightweight recompute — no system commands
-                        self.recompute_gateway_ip_from_ui();
-                    }
-                }
-            }
-        });
-
+        // TopBottomPanel must render before CentralPanel so it reserves space first
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let i = &self.i18n;
@@ -242,6 +217,33 @@ impl eframe::App for LanGatewayApp {
                     self.dashboard_info.active_interface,
                 ));
             });
+        });
+
+        // CentralPanel fills remaining space after SidePanel and TopBottomPanel
+        egui::CentralPanel::default().show(ctx, |ui| {
+            match self.tab {
+                Tab::Dashboard => {
+                    if self.dashboard.show(ui, &self.dashboard_info, &self.i18n) {
+                        self.start_background_refresh();
+                    }
+                }
+                Tab::Rules => {
+                    self.rules_panel.show(ui, &self.i18n);
+                }
+                Tab::Settings => {
+                    let prev_lang = self.i18n.language();
+                    let prev_ip = self.settings_panel.preferred_gateway_ip.clone();
+                    self.settings_panel
+                        .show(ui, &self.dashboard_info, &mut self.i18n);
+                    if self.i18n.language() != prev_lang {
+                        self.on_language_changed(self.i18n.language());
+                    }
+                    if self.settings_panel.preferred_gateway_ip != prev_ip {
+                        self.save_config_deferred();
+                        self.recompute_gateway_ip_from_ui();
+                    }
+                }
+            }
         });
 
         // Only request repaint while background refresh is in progress
