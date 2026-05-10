@@ -342,25 +342,32 @@ impl LanGatewayApp {
         let config_to_save = self.config.clone();
         let config_path = self.config_path.clone();
         std::thread::spawn(move || {
-            // Save config before exit
-            let mut s = status.lock().unwrap();
-            if let Err(e) = config_to_save.save(&config_path) {
-                logger::log_to_file(&format!("Failed to save config before update: {}", e));
-            }
-            logger::log_to_file(&format!(
-                "Starting update download: {} → {}",
-                download_url, latest_version
-            ));
-            *s = UpdateStatus::PreparingUpdate;
+            // Save config and update status — keep the lock scope minimal
+            {
+                let mut s = status.lock().unwrap();
+                if let Err(e) = config_to_save.save(&config_path) {
+                    logger::log_to_file(&format!("Failed to save config before update: {}", e));
+                }
+                logger::log_to_file(&format!(
+                    "Starting update download: {} → {}",
+                    download_url, latest_version
+                ));
+                *s = UpdateStatus::PreparingUpdate;
+            } // Lock released — download must NOT hold the Mutex
 
             match update::perform_update(&download_url, &latest_version) {
                 Ok(()) => {
-                    *s = UpdateStatus::Restarting;
-                    // process::exit called inside perform_update
+                    // process::exit called inside perform_update;
+                    // if we ever reach here, update status briefly
+                    if let Ok(mut s) = status.lock() {
+                        *s = UpdateStatus::Restarting;
+                    }
                 }
                 Err(e) => {
                     logger::log_to_file(&format!("Update failed: {}", e));
-                    *s = UpdateStatus::Failed(e);
+                    if let Ok(mut s) = status.lock() {
+                        *s = UpdateStatus::Failed(e);
+                    }
                 }
             }
         });
