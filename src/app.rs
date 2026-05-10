@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::model::{DashboardInfo, Language, PortproxyEntry, RefreshState};
 use crate::i18n::I18n;
+use crate::service::update::{self, UpdateStatus};
 use crate::storage::config::Config;
 use crate::system::{logger, network, portproxy, privilege};
 use crate::ui::{dashboard::DashboardPanel, fonts, rules::RulesPanel, settings::SettingsPanel};
@@ -29,6 +30,7 @@ pub struct LanGatewayApp {
     i18n: I18n,
     config: Config,
     refresh_pending: Arc<Mutex<Option<RefreshResult>>>,
+    update_status: Arc<Mutex<UpdateStatus>>,
     initial_refresh_done: bool,
     initial_health_started: bool,
 }
@@ -120,6 +122,7 @@ impl LanGatewayApp {
             i18n: I18n::new(language),
             config,
             refresh_pending,
+            update_status: Arc::new(Mutex::new(UpdateStatus::Idle)),
             initial_refresh_done: false,
             initial_health_started: false,
         }
@@ -285,6 +288,87 @@ impl LanGatewayApp {
             }
         }
     }
+
+    fn start_update_check(&mut self) {
+        let status = self.update_status.clone();
+        {
+            let mut s = status.lock().unwrap();
+            if s.is_busy() {
+                return;
+            }
+            *s = UpdateStatus::Checking;
+        }
+
+        std::thread::spawn(move || {
+            let result = update::check_update();
+            let mut s = status.lock().unwrap();
+            match result {
+                Ok(Some((latest, release_url, download_url))) => {
+                    *s = UpdateStatus::Available {
+                        latest,
+                        release_url,
+                        download_url,
+                    };
+                }
+                Ok(None) => {
+                    *s = UpdateStatus::UpToDate;
+                }
+                Err(e) => {
+                    *s = UpdateStatus::Failed(e);
+                }
+            }
+        });
+    }
+
+    fn start_update_download(&mut self) {
+        let (download_url, latest_version) = {
+            let s = self.update_status.lock().unwrap();
+            match &*s {
+                UpdateStatus::Available {
+                    download_url,
+                    latest,
+                    ..
+                } => (download_url.clone(), latest.clone()),
+                _ => return,
+            }
+        };
+
+        let status = self.update_status.clone();
+        {
+            let mut s = status.lock().unwrap();
+            *s = UpdateStatus::Downloading;
+        }
+
+        let config_to_save = self.config.clone();
+        let config_path = self.config_path.clone();
+        std::thread::spawn(move || {
+            // Save config before exit
+            let mut s = status.lock().unwrap();
+            if let Err(e) = config_to_save.save(&config_path) {
+                logger::log_to_file(&format!("Failed to save config before update: {}", e));
+            }
+            logger::log_to_file(&format!(
+                "Starting update download: {} → {}",
+                download_url, latest_version
+            ));
+            *s = UpdateStatus::PreparingUpdate;
+
+            match update::perform_update(&download_url, &latest_version) {
+                Ok(()) => {
+                    *s = UpdateStatus::Restarting;
+                    // process::exit called inside perform_update
+                }
+                Err(e) => {
+                    logger::log_to_file(&format!("Update failed: {}", e));
+                    *s = UpdateStatus::Failed(e);
+                }
+            }
+        });
+    }
+
+    fn get_update_status(&self) -> UpdateStatus {
+        self.update_status.lock().unwrap().clone()
+    }
 }
 
 impl eframe::App for LanGatewayApp {
@@ -344,8 +428,24 @@ impl eframe::App for LanGatewayApp {
         // CentralPanel fills remaining space after SidePanel and TopBottomPanel
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Dashboard => {
-                if self.dashboard.show(ui, &self.dashboard_info, &self.i18n) {
+                let update_status = self.get_update_status();
+                let mut check_update = false;
+                let mut download_update = false;
+                if self.dashboard.show(
+                    ui,
+                    &self.dashboard_info,
+                    &self.i18n,
+                    &update_status,
+                    &mut check_update,
+                    &mut download_update,
+                ) {
                     self.start_background_refresh();
+                }
+                if check_update {
+                    self.start_update_check();
+                }
+                if download_update {
+                    self.start_update_download();
                 }
             }
             Tab::Rules => {
@@ -366,9 +466,10 @@ impl eframe::App for LanGatewayApp {
             }
         });
 
-        // Request repaint while background refresh or health check is running
+        // Request repaint while background refresh, health check, or update is running
         let needs_repaint = matches!(self.dashboard_info.refresh_state, RefreshState::Refreshing)
-            || self.rules_panel.health_check_running;
+            || self.rules_panel.health_check_running
+            || self.get_update_status().is_busy();
         if needs_repaint {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }

@@ -1,5 +1,6 @@
 use crate::core::model::{DashboardInfo, RefreshState};
 use crate::i18n::I18n;
+use crate::service::update::UpdateStatus;
 use crate::system::privilege;
 
 pub struct DashboardPanel {
@@ -13,7 +14,15 @@ impl DashboardPanel {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, info: &DashboardInfo, i18n: &I18n) -> bool {
+    pub fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        info: &DashboardInfo,
+        i18n: &I18n,
+        update_status: &UpdateStatus,
+        checking_for_update: &mut bool,
+        downloading_update: &mut bool,
+    ) -> bool {
         let mut need_refresh = false;
         ui.heading(i18n.text("dashboard.title"));
 
@@ -117,6 +126,88 @@ impl DashboardPanel {
         if info.rule_count == 0 {
             ui.add_space(4.0);
             ui.label(i18n.text("dashboard.add_rule_hint"));
+        }
+
+        // --- Update section ---
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(4.0);
+        ui.strong(i18n.text("dashboard.updates"));
+
+        ui.horizontal(|ui| {
+            let busy = update_status.is_busy();
+            ui.label(format!(
+                "{} v{}",
+                i18n.text("dashboard.current_version"),
+                env!("CARGO_PKG_VERSION")
+            ));
+
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(i18n.text("dashboard.check_update")),
+                )
+                .clicked()
+            {
+                *checking_for_update = true;
+            }
+        });
+
+        match update_status {
+            UpdateStatus::Idle => {}
+            UpdateStatus::Checking => {
+                ui.colored_label(egui::Color32::GRAY, i18n.text("dashboard.update_checking"));
+            }
+            UpdateStatus::UpToDate => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(0, 180, 80),
+                    i18n.text("dashboard.update_uptodate"),
+                );
+            }
+            UpdateStatus::Available {
+                latest,
+                release_url,
+                download_url: _,
+            } => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 160, 0),
+                    format!("{}: {}", i18n.text("dashboard.update_available"), latest),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(i18n.text("dashboard.download_update")).clicked() {
+                        *downloading_update = true;
+                    }
+                    if ui.button(i18n.text("dashboard.open_release")).clicked() {
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/c", "start", "", release_url])
+                            .spawn();
+                    }
+                });
+            }
+            UpdateStatus::Downloading => {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    i18n.text("dashboard.update_downloading"),
+                );
+            }
+            UpdateStatus::PreparingUpdate => {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    i18n.text("dashboard.update_preparing"),
+                );
+            }
+            UpdateStatus::Restarting => {
+                ui.colored_label(
+                    egui::Color32::GREEN,
+                    i18n.text("dashboard.update_restarting"),
+                );
+            }
+            UpdateStatus::Failed(e) => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 80, 60),
+                    format!("{}: {}", i18n.text("dashboard.update_failed"), e),
+                );
+            }
         }
 
         need_refresh
