@@ -33,6 +33,7 @@ pub struct LanGatewayApp {
     update_status: Arc<Mutex<UpdateStatus>>,
     initial_refresh_done: bool,
     initial_health_started: bool,
+    initial_update_check_done: bool,
 }
 
 impl LanGatewayApp {
@@ -125,6 +126,7 @@ impl LanGatewayApp {
             update_status: Arc::new(Mutex::new(UpdateStatus::Idle)),
             initial_refresh_done: false,
             initial_health_started: false,
+            initial_update_check_done: false,
         }
     }
 
@@ -393,6 +395,12 @@ impl eframe::App for LanGatewayApp {
         {
             self.initial_health_started = true;
             self.rules_panel.run_health_checks_background();
+        }
+
+        // After initial refresh completes, auto-check for updates once
+        if self.initial_refresh_done && !self.initial_update_check_done {
+            self.initial_update_check_done = true;
+            self.start_update_check();
         }
 
         egui::SidePanel::left("sidebar")

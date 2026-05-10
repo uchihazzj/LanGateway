@@ -140,12 +140,15 @@ pub fn perform_update(download_url: &str, latest_version: &str) -> Result<(), St
     std::fs::write(&script_path, &script)
         .map_err(|e| format!("Failed to write updater script: {}", e))?;
 
-    // Launch updater
+    // Launch updater with hidden window (CREATE_NO_WINDOW prevents console flash)
+    use std::os::windows::process::CommandExt;
     std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
+            "-WindowStyle",
+            "Hidden",
             "-File",
             &script_path.to_string_lossy(),
             "-OldExe",
@@ -155,6 +158,7 @@ pub fn perform_update(download_url: &str, latest_version: &str) -> Result<(), St
             "-BakExe",
             &bak_exe.to_string_lossy(),
         ])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .spawn()
         .map_err(|e| format!("Failed to launch updater: {}", e))?;
 
@@ -171,7 +175,9 @@ fn updater_script() -> String {
 
 $ErrorActionPreference = "Stop"
 
-Start-Sleep -Seconds 2
+# Old process already exited (process::exit(0) was called before spawning us).
+# Brief sleep just in case the OS hasn't released the file lock yet.
+Start-Sleep -Seconds 1
 $timeout = 30
 while ($timeout -gt 0) {
     $proc = Get-Process -Name "PROCESS_NAME" -ErrorAction SilentlyContinue
@@ -186,7 +192,7 @@ try {
     }
     Move-Item -LiteralPath $NewExe -Destination $OldExe -Force -ErrorAction Stop
     Start-Process -FilePath $OldExe
-    Start-Sleep -Seconds 3
+    # Clean up backup immediately — the new process uses $OldExe, not $BakExe
     if (Test-Path -LiteralPath $BakExe) {
         Remove-Item -LiteralPath $BakExe -Force
     }
