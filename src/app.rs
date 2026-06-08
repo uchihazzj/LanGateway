@@ -736,7 +736,7 @@ impl eframe::App for LanGatewayApp {
                     &effective_config,
                     &self.config_path,
                     &self.rules_panel.proxy_entries,
-                    self.rules_panel.last_preflight.clone(),
+                    &self.rules_panel.last_preflight,
                     &self.settings_panel.mdns_status,
                     &self.i18n,
                 );
