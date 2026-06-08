@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::core::model::InterfaceInfo;
 use crate::system::{encoding, logger, process};
@@ -11,6 +11,17 @@ pub fn get_hostname() -> Option<String> {
     } else {
         None
     }
+}
+
+/// Fast startup path: parse plain ipconfig output for IPv4 addresses without
+/// waiting for the heavier PowerShell adapter join.
+pub fn get_quick_interfaces() -> Vec<InterfaceInfo> {
+    let output = match process::run_command("ipconfig", &[]) {
+        Ok(o) => o,
+        Err(_) => return vec![],
+    };
+    let text = encoding::decode(&output.stdout);
+    parse_ipconfig_interfaces(&text)
 }
 
 /// Primary: PowerShell Get-NetIPAddress + Get-NetAdapter → JSON, joined by InterfaceIndex.
@@ -42,7 +53,7 @@ fn get_interfaces_via_powershell() -> Option<Vec<InterfaceInfo>> {
         "powershell",
         &[
             "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-            "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -ne '127.0.0.1' } | Select-Object InterfaceAlias,InterfaceIndex,IPAddress,PrefixLength,AddressState | ConvertTo-Json -Depth 5",
+            "Get-NetIPAddress | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -ne '::1' } | Select-Object InterfaceAlias,InterfaceIndex,IPAddress,AddressFamily,PrefixLength,AddressState | ConvertTo-Json -Depth 5",
         ],
     ).ok()?;
 
@@ -108,6 +119,9 @@ struct PsIpAddr {
     #[serde(default)]
     #[serde(rename = "IPAddress")]
     ip_address: String,
+    #[serde(default)]
+    #[serde(rename = "AddressFamily")]
+    address_family: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -151,7 +165,8 @@ fn parse_powershell_output(ip_json: &str, ad_json: &str) -> Option<Vec<Interface
         adapters.len()
     ));
 
-    let mut interfaces = Vec::new();
+    let mut by_key: std::collections::BTreeMap<(i32, String), InterfaceInfo> =
+        std::collections::BTreeMap::new();
 
     for ip in &ip_addrs {
         if ip.ip_address.is_empty() || ip.ip_address == "0.0.0.0" {
@@ -184,20 +199,48 @@ fn parse_powershell_output(ip_json: &str, ad_json: &str) -> Option<Vec<Interface
 
         let is_virt = is_virtual_adapter(&name);
 
-        logger::log_to_file(&format!(
-            "  IP {} -> adapter '{}' (idx={}, virtual={}, mac={})",
-            ip.ip_address, name, ip.interface_index, is_virt, mac
-        ));
-
-        interfaces.push(InterfaceInfo {
-            name,
-            ipv4: ip.ip_address.clone(),
-            mac,
+        let key = (ip.interface_index, name.clone());
+        let entry = by_key.entry(key).or_insert_with(|| InterfaceInfo {
+            name: name.clone(),
+            ipv4: String::new(),
+            ipv6: Vec::new(),
+            mac: mac.clone(),
             is_virtual: is_virt,
         });
+
+        if is_ipv6_address(&ip.ip_address) {
+            if !is_usable_ipv6(&ip.ip_address) {
+                logger::log_to_file(&format!("  IPv6 skip: {} (not usable)", ip.ip_address));
+                continue;
+            }
+            if !entry.ipv6.contains(&ip.ip_address) {
+                entry.ipv6.push(ip.ip_address.clone());
+            }
+        } else {
+            entry.ipv4 = ip.ip_address.clone();
+        }
+
+        logger::log_to_file(&format!(
+            "  IP {} ({}) -> adapter '{}' (idx={}, virtual={}, mac={})",
+            ip.ip_address,
+            ps_address_family(&ip.address_family),
+            name,
+            ip.interface_index,
+            is_virt,
+            mac
+        ));
     }
 
-    Some(interfaces)
+    Some(by_key.into_values().collect())
+}
+
+fn ps_address_family(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Number(n) if n.as_u64() == Some(2) => "IPv4",
+        serde_json::Value::Number(n) if n.as_u64() == Some(23) => "IPv6",
+        serde_json::Value::String(s) if s.eq_ignore_ascii_case("IPv6") => "IPv6",
+        _ => "IPv4",
+    }
 }
 
 /// Fallback: parse `ipconfig /all` text output.
@@ -207,6 +250,10 @@ fn get_interfaces_via_ipconfig() -> Vec<InterfaceInfo> {
         Err(_) => return vec![],
     };
     let text = encoding::decode(&output.stdout);
+    parse_ipconfig_interfaces(&text)
+}
+
+fn parse_ipconfig_interfaces(text: &str) -> Vec<InterfaceInfo> {
     let mut interfaces = Vec::new();
     let mut current_name = String::new();
     let mut current_ipv4 = String::new();
@@ -220,6 +267,7 @@ fn get_interfaces_via_ipconfig() -> Vec<InterfaceInfo> {
                 interfaces.push(InterfaceInfo {
                     name: current_name.clone(),
                     ipv4: current_ipv4.clone(),
+                    ipv6: Vec::new(),
                     mac: current_mac.clone(),
                     is_virtual: is_virtual_adapter(&current_name),
                 });
@@ -239,6 +287,7 @@ fn get_interfaces_via_ipconfig() -> Vec<InterfaceInfo> {
                 interfaces.push(InterfaceInfo {
                     name: current_name.clone(),
                     ipv4: current_ipv4.clone(),
+                    ipv6: Vec::new(),
                     mac: current_mac.clone(),
                     is_virtual: is_virtual_adapter(&current_name),
                 });
@@ -271,6 +320,7 @@ fn get_interfaces_via_ipconfig() -> Vec<InterfaceInfo> {
             is_virtual: is_virt,
             name: current_name,
             ipv4: current_ipv4,
+            ipv6: Vec::new(),
             mac: current_mac,
         });
     }
@@ -292,15 +342,6 @@ pub fn is_apipa_ipv4(ip: &str) -> bool {
         .map(|a| {
             let o = a.octets();
             o[0] == 169 && o[1] == 254
-        })
-        .unwrap_or(false)
-}
-
-pub fn is_benchmark_ipv4(ip: &str) -> bool {
-    ip.parse::<Ipv4Addr>()
-        .map(|a| {
-            let o = a.octets();
-            o[0] == 198 && (o[1] == 18 || o[1] == 19)
         })
         .unwrap_or(false)
 }
@@ -356,6 +397,30 @@ pub fn usable_gateway_ipv4_addresses(interfaces: &[InterfaceInfo]) -> Vec<String
         .map(|i| i.ipv4.clone())
         .filter(|ip| is_usable_gateway_ipv4(ip) && seen.insert(ip.clone()))
         .collect()
+}
+
+pub fn ipv6_addresses_from(interfaces: &[InterfaceInfo]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    interfaces
+        .iter()
+        .flat_map(|i| i.ipv6.iter().cloned())
+        .filter(|ip| seen.insert(ip.clone()))
+        .collect()
+}
+
+pub fn is_ipv6_address(ip: &str) -> bool {
+    ip.parse::<Ipv6Addr>().is_ok()
+}
+
+pub fn is_usable_ipv6(ip: &str) -> bool {
+    ip.parse::<Ipv6Addr>()
+        .map(|addr| {
+            !addr.is_loopback()
+                && !addr.is_unspecified()
+                && !addr.is_multicast()
+                && !addr.is_unique_local()
+        })
+        .unwrap_or(false)
 }
 
 pub fn is_virtual_adapter(name: &str) -> bool {
@@ -489,6 +554,7 @@ mod tests {
         InterfaceInfo {
             name: name.into(),
             ipv4: ip.into(),
+            ipv6: Vec::new(),
             mac: String::new(),
             is_virtual,
         }
@@ -530,6 +596,16 @@ mod tests {
         assert_eq!(result[0].mac, "AA-BB-CC-DD-EE-FF");
     }
 
+    #[test]
+    fn join_ipv4_and_ipv6_on_same_adapter() {
+        let ip_json = r#"[{"InterfaceAlias":"Ethernet","InterfaceIndex":12,"IPAddress":"10.0.0.1","AddressFamily":"IPv4"},{"InterfaceAlias":"Ethernet","InterfaceIndex":12,"IPAddress":"2001:db8::10","AddressFamily":"IPv6"}]"#;
+        let ad_json = r#"{"Name":"Ethernet","InterfaceIndex":12,"MacAddress":"AA-BB"}"#;
+        let result = parse_powershell_output(ip_json, ad_json).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].ipv4, "10.0.0.1");
+        assert_eq!(result[0].ipv6, vec!["2001:db8::10".to_string()]);
+    }
+
     // --- IP classification ---
 
     #[test]
@@ -538,17 +614,6 @@ mod tests {
         assert!(is_apipa_ipv4("169.254.0.1"));
         assert!(!is_apipa_ipv4("169.253.1.1"));
         assert!(!is_apipa_ipv4("10.0.0.1"));
-    }
-
-    #[test]
-    fn benchmark_ipv4_is_detected() {
-        assert!(is_benchmark_ipv4("198.18.0.1"));
-        assert!(is_benchmark_ipv4("198.18.255.255"));
-        assert!(is_benchmark_ipv4("198.19.0.1"));
-        assert!(is_benchmark_ipv4("198.19.255.255"));
-        assert!(!is_benchmark_ipv4("198.17.0.1"));
-        assert!(!is_benchmark_ipv4("198.20.0.1"));
-        assert!(!is_benchmark_ipv4("10.0.0.1"));
     }
 
     #[test]
@@ -564,6 +629,15 @@ mod tests {
         assert!(!is_usable_gateway_ipv4("198.19.0.1"));
         assert!(!is_usable_gateway_ipv4("224.0.0.1"));
         assert!(!is_usable_gateway_ipv4("255.255.255.255"));
+    }
+
+    #[test]
+    fn usable_ipv6_filters_loopback_and_local_only() {
+        assert!(!is_usable_ipv6("::1"));
+        assert!(!is_usable_ipv6("::"));
+        assert!(!is_usable_ipv6("ff02::1"));
+        assert!(!is_usable_ipv6("fd00::1"));
+        assert!(is_usable_ipv6("2001:db8::1"));
     }
 
     #[test]

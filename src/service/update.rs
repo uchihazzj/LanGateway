@@ -162,6 +162,10 @@ pub fn perform_update(download_url: &str, latest_version: &str) -> Result<(), St
         .spawn()
         .map_err(|e| format!("Failed to launch updater: {}", e))?;
 
+    crate::system::logger::log_to_file(&format!(
+        "Updater launched for v{}, exiting for self-replacement",
+        latest_version
+    ));
     std::process::exit(0);
 }
 

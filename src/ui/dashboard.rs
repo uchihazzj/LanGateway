@@ -80,7 +80,7 @@ impl DashboardPanel {
         ui.heading(i18n.text("dashboard.quick_actions"));
 
         ui.horizontal(|ui| {
-            let is_refreshing = matches!(info.refresh_state, RefreshState::Refreshing);
+            let is_refreshing = matches!(info.refresh_state, RefreshState::Refreshing { .. });
             let btn_text = if is_refreshing {
                 "  ...  "
             } else {
@@ -110,8 +110,8 @@ impl DashboardPanel {
 
         ui.add_space(4.0);
         match &info.refresh_state {
-            RefreshState::Refreshing => {
-                ui.label("Refreshing...");
+            RefreshState::Refreshing { stage } => {
+                ui.label(format!("{}: {}", i18n.text("dashboard.refreshing"), stage));
             }
             RefreshState::Done { error, .. } => {
                 if let Some(err) = error {
