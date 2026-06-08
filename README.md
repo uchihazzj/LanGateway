@@ -93,6 +93,12 @@ mDNS uses standard UDP port 5353. LanGateway attempts a shared bind with `SO_REU
 
 Common UDP 5353 occupants include Chrome Cast Discovery, Steam, and Windows DNS Client (`Dnscache`). If mDNS cannot start, use direct IP access, a client hosts-file entry, router DNS, or campus DNS as a fallback. If the campus network blocks multicast between clients, `.local` discovery may not work across that network segment.
 
+For a quick manual mDNS check from this repo, run:
+
+```bash
+python scripts/query_mdns.py gateway.local
+```
+
 ## Startup Refresh
 
 LanGateway renders the window immediately with saved configuration data. Startup refresh then proceeds in stages:

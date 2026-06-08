@@ -1,4 +1,7 @@
 target/
 .claude/
 CLAUDE.md
+AGENTS.md
 config.json
+__pycache__/
+*.pyc
