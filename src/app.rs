@@ -571,20 +571,22 @@ impl LanGatewayApp {
         let config_to_save = self.effective_config();
         let config_path = self.config_path.clone();
         std::thread::spawn(move || {
-            // Save config and update status — keep the lock scope minimal
-            {
-                let mut s = status.lock().unwrap();
-                if let Err(e) = config_to_save.save(&config_path) {
-                    logger::log_to_file(&format!("Failed to save config before update: {}", e));
-                }
-                logger::log_to_file(&format!(
-                    "Starting update download: {} -> {}",
-                    download_url, latest_version
-                ));
-                *s = UpdateStatus::PreparingUpdate;
-            } // Lock released — download must NOT hold the Mutex
+            if let Err(e) = config_to_save.save(&config_path) {
+                logger::log_to_file(&format!("Failed to save config before update: {}", e));
+            }
+            logger::log_to_file(&format!(
+                "Starting update download: {} -> {}",
+                download_url, latest_version
+            ));
 
-            match update::perform_update(&download_url, &latest_version) {
+            let status_for_update = status.clone();
+            let set_status = move |next_status| {
+                if let Ok(mut s) = status_for_update.lock() {
+                    *s = next_status;
+                }
+            };
+
+            match update::perform_update(&download_url, &latest_version, set_status) {
                 Ok(()) => {
                     // process::exit called inside perform_update;
                     // if we ever reach here, update status briefly

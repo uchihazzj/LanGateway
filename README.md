@@ -18,7 +18,7 @@ Windows desktop tool for managing `netsh interface portproxy` TCP forwarding rul
 - **Settings** - zh-CN / en-US language switching, Preferred Gateway IP, adapter list, and mDNS controls.
 - **CJK Fonts** - Auto-loaded from Windows system fonts.
 - **UAC Elevation** - Restart as Administrator for non-admin mode.
-- **Auto Update** - Automatic update check on startup plus manual check from Dashboard.
+- **Auto Update** - Automatic update check on startup, manual check from Dashboard, proxy fallback, and PowerShell self-replacement.
 
 ## Requirements
 
@@ -102,6 +102,29 @@ LanGateway renders the window immediately with saved configuration data. Startup
 3. Deferred checks: health checks and update checks start only after the full startup refresh completes.
 
 This means the first screen should appear quickly, while exact system state continues to settle in the background.
+
+## Auto Update
+
+LanGateway checks the latest GitHub Release after startup refresh completes. Manual checks are also available from Dashboard.
+
+Release requirements:
+
+- GitHub tags should use `vX.Y.Z`, while `Cargo.toml` uses `X.Y.Z`.
+- The release asset must be named exactly `langateway.exe`.
+- The updater downloads the asset next to the running executable as `langateway-vX.Y.Z.exe`, then uses `updater.ps1` to replace the fixed `langateway.exe`.
+
+Network behavior:
+
+- Release API checks try a direct GitHub connection first, then fall back to system proxy settings.
+- Asset downloads try system proxy settings first, then fall back to direct GitHub download.
+- All update network work runs on a background thread and never blocks the UI thread.
+
+Replacement behavior:
+
+- Before replacing the exe, LanGateway saves the current config.
+- The PowerShell updater writes `updater.log` next to the executable.
+- The updater verifies the downloaded exe is not suspiciously small, backs up the old exe as `langateway.exe.bak`, retries locked-file replacement, and attempts rollback on failure.
+- If LanGateway is installed under a protected directory such as `C:\Program Files`, replacement may fail unless the process has write permission. The app does not silently request elevation for updates.
 
 ## Build from Source
 
