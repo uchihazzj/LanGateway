@@ -25,9 +25,17 @@ enum Tab {
 /// Bundled result from a background refresh stage.
 struct RefreshResult {
     generation: u64,
+    rules_generation: u64,
     info: DashboardInfo,
     proxy_entries: Option<Vec<PortproxyEntry>>,
     complete: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RefreshKind {
+    Startup,
+    Manual,
+    Network,
 }
 
 fn should_apply_refresh(generation: u64, state: &RefreshState, result: &RefreshResult) -> bool {
@@ -150,7 +158,14 @@ impl LanGatewayApp {
         let refresh_pending: Arc<Mutex<VecDeque<RefreshResult>>> =
             Arc::new(Mutex::new(VecDeque::new()));
 
-        Self::spawn_refresh_workers(config.clone(), refresh_pending.clone(), 0);
+        Self::spawn_refresh_workers(
+            config.clone(),
+            refresh_pending.clone(),
+            0,
+            rules_panel.snapshot_generation(),
+            RefreshKind::Startup,
+            cc.egui_ctx.clone(),
+        );
 
         let state = Arc::new(Mutex::new(AppState::new(
             config.clone(),
@@ -193,19 +208,29 @@ impl LanGatewayApp {
         config: Config,
         pending: Arc<Mutex<VecDeque<RefreshResult>>>,
         generation: u64,
+        rules_generation: u64,
+        kind: RefreshKind,
+        ctx: egui::Context,
     ) {
-        let quick_cfg = config.clone();
-        let quick_pending = pending.clone();
-        std::thread::spawn(move || {
-            let mut result = Self::build_quick_dashboard_info(&quick_cfg);
-            result.generation = generation;
-            Self::push_refresh_result(&quick_pending, result);
-        });
+        if kind == RefreshKind::Startup {
+            let quick_cfg = config.clone();
+            let quick_pending = pending.clone();
+            let quick_ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let mut result = Self::build_quick_dashboard_info(&quick_cfg);
+                result.generation = generation;
+                result.rules_generation = rules_generation;
+                Self::push_refresh_result(&quick_pending, result);
+                quick_ctx.request_repaint();
+            });
+        }
 
         std::thread::spawn(move || {
-            let mut result = Self::build_full_dashboard_info(&config);
+            let mut result = Self::build_full_dashboard_info(&config, kind != RefreshKind::Network);
             result.generation = generation;
+            result.rules_generation = rules_generation;
             Self::push_refresh_result(&pending, result);
+            ctx.request_repaint();
         });
     }
 
@@ -233,6 +258,7 @@ impl LanGatewayApp {
 
         RefreshResult {
             generation: 0,
+            rules_generation: 0,
             info: DashboardInfo {
                 hostname,
                 local_ipv4: usable_ipv4s,
@@ -250,18 +276,25 @@ impl LanGatewayApp {
     }
 
     /// Heavy stage: PowerShell network details and all PortProxy modes.
-    fn build_full_dashboard_info(config: &Config) -> RefreshResult {
+    fn build_full_dashboard_info(config: &Config, refresh_rules: bool) -> RefreshResult {
         let is_admin = privilege::is_admin();
         let hostname = network::get_hostname().unwrap_or_else(|| "unknown".into());
         let interfaces = network::get_active_interfaces();
         let ipv4s = network::ipv4_addresses_from(&interfaces);
         let ipv6s = network::ipv6_addresses_from(&interfaces);
         let usable_ipv4s = network::usable_gateway_ipv4_addresses(&interfaces);
-        let (proxy_entries, proxy_error) = match portproxy::show_all() {
-            Ok(entries) => (Some(entries), None),
-            Err(e) => {
-                logger::log_to_file(&format!("Background refresh: netsh show all failed: {}", e));
-                (None, Some(e))
+        let (proxy_entries, proxy_error) = if !refresh_rules {
+            (None, None)
+        } else {
+            match portproxy::show_all() {
+                Ok(entries) => (Some(entries), None),
+                Err(e) => {
+                    logger::log_to_file(&format!(
+                        "Background refresh: netsh show all failed: {}",
+                        e
+                    ));
+                    (None, Some(e))
+                }
             }
         };
 
@@ -280,6 +313,7 @@ impl LanGatewayApp {
 
         RefreshResult {
             generation: 0,
+            rules_generation: 0,
             info: DashboardInfo {
                 hostname,
                 local_ipv4: usable_ipv4s,
@@ -296,7 +330,7 @@ impl LanGatewayApp {
         }
     }
 
-    fn start_background_refresh(&mut self) {
+    fn start_background_refresh(&mut self, ctx: &egui::Context, kind: RefreshKind) {
         if self.rules_panel.is_busy() {
             return;
         }
@@ -317,6 +351,9 @@ impl LanGatewayApp {
             self.effective_config(),
             self.refresh_pending.clone(),
             self.refresh_generation,
+            self.rules_panel.snapshot_generation(),
+            kind,
+            ctx.clone(),
         );
     }
 
@@ -362,7 +399,12 @@ impl LanGatewayApp {
             }
             self.dashboard_info = info;
             self.recompute_gateway_ip_from_ui();
-            if let Some(proxy_entries) = result.proxy_entries {
+            // A rule edit can finish while this read-only query is in flight.
+            // Its newer Windows snapshot must not be replaced by the older read.
+            if let Some(proxy_entries) = result
+                .proxy_entries
+                .filter(|_| self.rules_panel.can_apply_snapshot(result.rules_generation))
+            {
                 let proxy_entries = if result.complete {
                     proxy_entries
                 } else {
@@ -410,7 +452,7 @@ impl LanGatewayApp {
         self.sync_mdns_state_impl(false);
     }
 
-    fn maybe_refresh_for_mdns(&mut self) {
+    fn maybe_refresh_for_mdns(&mut self, ctx: &egui::Context) {
         if !self.settings_panel.mdns_enabled || !self.initial_refresh_done {
             return;
         }
@@ -425,7 +467,7 @@ impl LanGatewayApp {
         }
         self.last_mdns_auto_refresh = Instant::now();
         logger::log_to_file("mDNS: scheduled network refresh for dynamic IP tracking");
-        self.start_background_refresh();
+        self.start_background_refresh(ctx, RefreshKind::Network);
     }
 
     fn sync_mdns_state_impl(&mut self, force: bool) {
@@ -704,7 +746,7 @@ impl eframe::App for LanGatewayApp {
         self.apply_update_result(ctx);
         self.dashboard_info.rule_count = self.rules_panel.proxy_entries.len();
         self.sync_mdns_state();
-        self.maybe_refresh_for_mdns();
+        self.maybe_refresh_for_mdns(ctx);
 
         // Always consume health check results (not just when on Rules tab)
         self.rules_panel.apply_health_results();
@@ -719,10 +761,12 @@ impl eframe::App for LanGatewayApp {
             state.update_status = self.get_update_status();
             state.operation = if self.rules_panel.is_busy() {
                 OperationState::ApplyingRules
-            } else if matches!(
-                self.dashboard_info.refresh_state,
-                RefreshState::Refreshing { .. }
-            ) {
+            } else if self.rules_panel.is_refreshing()
+                || matches!(
+                    self.dashboard_info.refresh_state,
+                    RefreshState::Refreshing { .. }
+                )
+            {
                 OperationState::Refreshing
             } else if self.rules_panel.health_check_running {
                 OperationState::CheckingHealth
@@ -749,12 +793,7 @@ impl eframe::App for LanGatewayApp {
             self.get_update_status(),
             UpdateStatus::Downloading | UpdateStatus::PreparingUpdate | UpdateStatus::Restarting
         );
-        self.rules_panel.operations_blocked = self.config_load_error.is_some()
-            || updating
-            || matches!(
-                self.dashboard_info.refresh_state,
-                RefreshState::Refreshing { .. }
-            );
+        self.rules_panel.operations_blocked = self.config_load_error.is_some() || updating;
 
         egui::SidePanel::left("sidebar")
             .exact_width(184.0)
@@ -808,15 +847,15 @@ impl eframe::App for LanGatewayApp {
                 } else {
                     "status.admin_no"
                 };
-                let gateway_display = if matches!(
+                let gateway_display = if !self.dashboard_info.gateway_ip.is_empty() {
+                    &self.dashboard_info.gateway_ip
+                } else if matches!(
                     self.dashboard_info.refresh_state,
                     RefreshState::Refreshing { .. }
                 ) {
                     i.text("status.initializing")
-                } else if self.dashboard_info.gateway_ip.is_empty() {
-                    i.text("status.no_usable_ipv4")
                 } else {
-                    &self.dashboard_info.gateway_ip
+                    i.text("status.no_usable_ipv4")
                 };
                 ui.label(format!(
                     "{} | {}: {} | {}: {} | {}: {} | {}{}",
@@ -859,7 +898,7 @@ impl eframe::App for LanGatewayApp {
                     })
                     .inner;
                 if refresh {
-                    self.start_background_refresh();
+                    self.start_background_refresh(ctx, RefreshKind::Manual);
                 }
                 if check_update {
                     self.start_update_check();
@@ -926,6 +965,7 @@ impl eframe::App for LanGatewayApp {
             self.dashboard_info.refresh_state,
             RefreshState::Refreshing { .. }
         ) || self.rules_panel.health_check_running
+            || self.rules_panel.is_refreshing()
             || self.rules_panel.is_busy()
             || matches!(self.settings_panel.mdns_status, mdns::MdnsStatus::Starting)
             || self.get_update_status().is_busy();
@@ -958,6 +998,7 @@ mod tests {
     fn refresh(generation: u64, complete: bool) -> RefreshResult {
         RefreshResult {
             generation,
+            rules_generation: 0,
             complete,
             proxy_entries: None,
             info: DashboardInfo {

@@ -91,13 +91,11 @@ impl DashboardPanel {
 
         ui.horizontal(|ui| {
             let is_refreshing = matches!(info.refresh_state, RefreshState::Refreshing { .. });
-            let btn_text = if is_refreshing {
-                "  ...  "
-            } else {
-                i18n.text("dashboard.refresh_status")
-            };
             if ui
-                .add_enabled(!is_refreshing, egui::Button::new(btn_text))
+                .add_enabled(
+                    !is_refreshing,
+                    egui::Button::new(i18n.text("dashboard.refresh_status")),
+                )
                 .clicked()
             {
                 need_refresh = true;
@@ -128,7 +126,17 @@ impl DashboardPanel {
         ui.add_space(4.0);
         match &info.refresh_state {
             RefreshState::Refreshing { stage } => {
-                ui.label(format!("{}: {}", i18n.text("dashboard.refreshing"), stage));
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.add(
+                        egui::Label::new(i18n.text(if *stage == "startup" {
+                            "status.initializing"
+                        } else {
+                            "dashboard.refreshing_background"
+                        }))
+                        .wrap(),
+                    );
+                });
             }
             RefreshState::Done { error, .. } => {
                 if let Some(err) = error {

@@ -19,8 +19,12 @@ enum RuleCompletion {
     Save(&'static str),
     Toggle(usize, bool),
     Delete(usize),
-    Refresh,
     DeleteOrphan,
+}
+
+struct RuleRefreshResult {
+    generation: u64,
+    result: Result<Vec<PortproxyEntry>, String>,
 }
 
 struct RuleOperationResult {
@@ -42,6 +46,8 @@ pub struct RulesPanel {
     pub health_check_running: bool,
     pub health_result_rx: Option<Receiver<HealthCheckResult>>,
     operation_rx: Option<Receiver<RuleOperationResult>>,
+    refresh_rx: Option<Receiver<RuleRefreshResult>>,
+    snapshot_generation: u64,
     pub operations_blocked: bool,
     pub editing_rule_index: Option<usize>,
     pub add_listen_address: String,
@@ -73,6 +79,8 @@ impl RulesPanel {
             health_check_running: false,
             health_result_rx: None,
             operation_rx: None,
+            refresh_rx: None,
+            snapshot_generation: 0,
             operations_blocked: false,
             editing_rule_index: None,
             add_listen_address: "0.0.0.0".into(),
@@ -104,17 +112,60 @@ impl RulesPanel {
         self.update_preflight_notes();
     }
 
-    pub fn refresh_proxy(&mut self) {
-        if let Err(e) = self.start_operation(
-            |_, _| crate::system::portproxy::show_all(),
-            RuleCompletion::Refresh,
-        ) {
-            self.status_message = e;
+    pub fn refresh_proxy(&mut self, ctx: &egui::Context) {
+        if self.is_busy() || self.operations_blocked || self.is_refreshing() {
+            return;
         }
+        let generation = self.snapshot_generation;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.refresh_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(RuleRefreshResult {
+                generation,
+                result: crate::system::portproxy::show_all(),
+            });
+            ctx.request_repaint();
+        });
     }
 
     pub fn is_busy(&self) -> bool {
         self.operation_rx.is_some()
+    }
+
+    pub fn is_refreshing(&self) -> bool {
+        self.refresh_rx.is_some()
+    }
+
+    pub fn snapshot_generation(&self) -> u64 {
+        self.snapshot_generation
+    }
+
+    pub fn can_apply_snapshot(&self, generation: u64) -> bool {
+        generation == self.snapshot_generation && !self.is_busy()
+    }
+
+    fn apply_refresh_results(&mut self, i18n: &I18n) {
+        let Some(rx) = &self.refresh_rx else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.refresh_rx = None;
+                self.status_message = i18n.text("rules.operation_failed").into();
+                return;
+            }
+        };
+        self.refresh_rx = None;
+        if !self.can_apply_snapshot(result.generation) {
+            return;
+        }
+        match result.result {
+            Ok(entries) => self.apply_proxy_entries(entries),
+            Err(error) => {
+                self.status_message = format!("{}: {error}", i18n.text("rules.operation_failed"));
+            }
+        }
     }
 
     fn start_operation(
@@ -130,6 +181,7 @@ impl RulesPanel {
         let service = self.service.clone();
         let mut config = self.config.clone();
         let (tx, rx) = std::sync::mpsc::channel();
+        self.snapshot_generation += 1;
         self.operation_rx = Some(rx);
         std::thread::spawn(move || {
             let result = task(&service, &mut config);
@@ -149,6 +201,7 @@ impl RulesPanel {
     }
 
     pub fn apply_operation_results(&mut self, i18n: &I18n) {
+        self.apply_refresh_results(i18n);
         let Some(rx) = &self.operation_rx else { return };
         let result = match rx.try_recv() {
             Ok(result) => result,
@@ -192,7 +245,7 @@ impl RulesPanel {
                         self.adjust_editing_after_delete(index);
                         String::new()
                     }
-                    RuleCompletion::Refresh | RuleCompletion::DeleteOrphan => String::new(),
+                    RuleCompletion::DeleteOrphan => String::new(),
                 };
             }
             Err(e) => {
@@ -319,6 +372,7 @@ impl RulesPanel {
             .ok_or_else(|| i18n.text("err.invalid_orphan_index").to_string())?;
         let key = OrphanKey::from_entry(entry);
         self.service.adopt_orphan(&mut self.config, entry)?;
+        self.snapshot_generation += 1;
         self.health_map
             .insert(self.config.rules.len() - 1, HealthStatus::NotChecked);
         self.orphan_health.remove(&key);
@@ -330,6 +384,9 @@ impl RulesPanel {
         let count = self
             .service
             .adopt_all_orphans(&mut self.config, &self.proxy_entries)?;
+        if count > 0 {
+            self.snapshot_generation += 1;
+        }
         self.health_map.clear();
         for i in 0..self.config.rules.len() {
             self.health_map.insert(i, HealthStatus::NotChecked);
@@ -382,6 +439,11 @@ impl RulesPanel {
             });
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(100));
+        } else if self.is_refreshing() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(i18n.text("rules.refreshing"));
+            });
         }
         ui.add_enabled_ui(!self.is_busy() && !self.operations_blocked, |ui| {
             if !self.last_preflight.is_empty() {
@@ -417,10 +479,14 @@ impl RulesPanel {
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button(i18n.text("rules.refresh")).clicked() {
-                    self.clear_form();
-                    self.editing_rule_index = None;
-                    self.refresh_proxy();
+                if ui
+                    .add_enabled(
+                        !self.is_refreshing(),
+                        egui::Button::new(i18n.text("rules.refresh")),
+                    )
+                    .clicked()
+                {
+                    self.refresh_proxy(ui.ctx());
                 }
                 let label = if self.health_check_running {
                     "..."
@@ -451,9 +517,9 @@ impl RulesPanel {
             .id_salt("managed_rules_scroll")
             .show(ui, |ui| {
                 crate::ui::theme::card(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
                     egui::Grid::new("rules_grid")
                         .num_columns(5)
-                        .max_col_width(128.0)
                         .spacing([14.0, 10.0])
                         .min_row_height(44.0)
                         .striped(true)
@@ -514,14 +580,35 @@ impl RulesPanel {
                                         .on_hover_text(&rule.notes);
                                     }
                                 });
-                                ui.monospace(endpoint(&rule.listen_address, rule.listen_port));
-                                ui.monospace(endpoint(&rule.connect_address, rule.connect_port));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(endpoint(
+                                            &rule.listen_address,
+                                            rule.listen_port,
+                                        ))
+                                        .monospace(),
+                                    )
+                                    .extend(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(endpoint(
+                                            &rule.connect_address,
+                                            rule.connect_port,
+                                        ))
+                                        .monospace(),
+                                    )
+                                    .extend(),
+                                );
 
                                 let health =
                                     self.health_map.get(&i).unwrap_or(&HealthStatus::NotChecked);
-                                ui.colored_label(
-                                    health.color(),
-                                    health.label(self.config.language),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(health.label(self.config.language))
+                                            .color(health.color()),
+                                    )
+                                    .extend(),
                                 )
                                 .on_hover_text(health.detail());
 
@@ -606,9 +693,9 @@ impl RulesPanel {
             .id_salt("orphan_rules_scroll")
             .show(ui, |ui| {
                 crate::ui::theme::card(ui).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
                     egui::Grid::new("orphan_grid")
                         .num_columns(5)
-                        .max_col_width(128.0)
                         .spacing([14.0, 10.0])
                         .min_row_height(40.0)
                         .striped(true)
@@ -629,17 +716,38 @@ impl RulesPanel {
 
                             for (i, entry) in orphans.iter().enumerate() {
                                 ui.label(entry.proxy_mode.label());
-                                ui.monospace(endpoint(&entry.listen_address, entry.listen_port));
-                                ui.monospace(endpoint(&entry.connect_address, entry.connect_port));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(endpoint(
+                                            &entry.listen_address,
+                                            entry.listen_port,
+                                        ))
+                                        .monospace(),
+                                    )
+                                    .extend(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(endpoint(
+                                            &entry.connect_address,
+                                            entry.connect_port,
+                                        ))
+                                        .monospace(),
+                                    )
+                                    .extend(),
+                                );
 
                                 let key = OrphanKey::from_entry(entry);
                                 let status = self
                                     .orphan_health
                                     .get(&key)
                                     .unwrap_or(&HealthStatus::NotChecked);
-                                ui.colored_label(
-                                    status.color(),
-                                    status.label(self.config.language),
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(status.label(self.config.language))
+                                            .color(status.color()),
+                                    )
+                                    .extend(),
                                 )
                                 .on_hover_text(status.detail());
 
@@ -1069,7 +1177,7 @@ mod tests {
             config: worker_config,
             result: Ok(vec![]),
             recovered_entries: None,
-            completion: RuleCompletion::Refresh,
+            completion: RuleCompletion::DeleteOrphan,
         })
         .unwrap();
         panel.apply_operation_results(&I18n::new(Language::EnUs));
@@ -1087,11 +1195,11 @@ mod tests {
                     assert_ne!(std::thread::current().id(), ui_thread);
                     Ok(vec![])
                 },
-                RuleCompletion::Refresh,
+                RuleCompletion::DeleteOrphan,
             )
             .unwrap();
         assert!(panel
-            .start_operation(|_, _| Ok(vec![]), RuleCompletion::Refresh)
+            .start_operation(|_, _| Ok(vec![]), RuleCompletion::DeleteOrphan)
             .is_err());
         let result = panel
             .operation_rx
@@ -1100,6 +1208,107 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .unwrap();
         assert!(result.result.is_ok());
+    }
+
+    #[test]
+    fn read_only_refresh_keeps_the_editor_available_and_preserves_the_form() {
+        let mut panel = make_panel();
+        panel.add_name = "unfinished rule".into();
+        panel.add_listen_port = "8080".into();
+        let (tx, rx) = std::sync::mpsc::channel();
+        panel.refresh_rx = Some(rx);
+        assert!(panel.is_refreshing());
+        assert!(!panel.is_busy());
+        tx.send(RuleRefreshResult {
+            generation: panel.snapshot_generation(),
+            result: Ok(vec![make_entry(
+                ProxyMode::V4ToV4,
+                "0.0.0.0",
+                8080,
+                "192.0.2.1",
+                80,
+            )]),
+        })
+        .unwrap();
+        panel.apply_operation_results(&I18n::new(Language::EnUs));
+        assert_eq!(panel.proxy_entries.len(), 1);
+        assert_eq!(panel.add_name, "unfinished rule");
+        assert_eq!(panel.add_listen_port, "8080");
+        assert!(!panel.is_refreshing());
+    }
+
+    #[test]
+    fn query_started_before_a_rule_write_cannot_restore_its_old_snapshot() {
+        let mut panel = make_panel();
+        let old_generation = panel.snapshot_generation();
+        let new_entries = vec![make_entry(
+            ProxyMode::V4ToV4,
+            "0.0.0.0",
+            9000,
+            "192.0.2.2",
+            443,
+        )];
+        let worker_entries = new_entries.clone();
+        panel
+            .start_operation(move |_, _| Ok(worker_entries), RuleCompletion::DeleteOrphan)
+            .unwrap();
+        assert!(!panel.can_apply_snapshot(old_generation));
+        let result = panel
+            .operation_rx
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        panel.operation_rx = Some(write_rx);
+        write_tx.send(result).unwrap();
+        panel.apply_operation_results(&I18n::new(Language::EnUs));
+        assert_eq!(panel.proxy_entries, new_entries);
+        assert!(!panel.is_busy());
+        assert!(!panel.can_apply_snapshot(old_generation));
+
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        panel.refresh_rx = Some(read_rx);
+        read_tx
+            .send(RuleRefreshResult {
+                generation: old_generation,
+                result: Ok(vec![]),
+            })
+            .unwrap();
+        panel.apply_operation_results(&I18n::new(Language::EnUs));
+        assert_eq!(panel.proxy_entries, new_entries);
+        assert!(!panel.is_refreshing());
+    }
+
+    #[test]
+    fn failed_or_disconnected_read_refresh_leaves_edits_available() {
+        let mut panel = make_panel();
+        let original = vec![make_entry(
+            ProxyMode::V4ToV4,
+            "0.0.0.0",
+            8080,
+            "192.0.2.1",
+            80,
+        )];
+        panel.apply_proxy_entries(original.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        panel.refresh_rx = Some(rx);
+        tx.send(RuleRefreshResult {
+            generation: panel.snapshot_generation(),
+            result: Err("query failed".into()),
+        })
+        .unwrap();
+        panel.apply_operation_results(&I18n::new(Language::EnUs));
+        assert!(!panel.is_busy());
+        assert!(!panel.is_refreshing());
+        assert_eq!(panel.proxy_entries, original);
+        assert!(panel.status_message.contains("query failed"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        panel.refresh_rx = Some(rx);
+        drop(tx);
+        panel.apply_operation_results(&I18n::new(Language::EnUs));
+        assert!(!panel.is_busy());
+        assert!(!panel.is_refreshing());
     }
 
     #[test]

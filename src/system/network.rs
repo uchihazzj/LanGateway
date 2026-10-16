@@ -48,64 +48,44 @@ pub fn get_active_interfaces() -> Vec<InterfaceInfo> {
 }
 
 fn get_interfaces_via_powershell() -> Option<Vec<InterfaceInfo>> {
-    // Command: Get IP addresses
-    let ip_output = process::run_command(
+    // Query both data sets in one PowerShell host instead of starting it twice.
+    let output = process::run_command(
         "powershell",
         &[
-            "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-            "Get-NetIPAddress | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -ne '::1' } | Select-Object InterfaceAlias,InterfaceIndex,IPAddress,AddressFamily,PrefixLength,AddressState | ConvertTo-Json -Depth 5",
+            "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+            "$ErrorActionPreference = 'Stop'; $ips = @(Get-NetIPAddress | Where-Object { $_.IPAddress -ne '127.0.0.1' -and $_.IPAddress -ne '::1' } | Select-Object InterfaceAlias,InterfaceIndex,IPAddress,AddressFamily); $adapters = @(try { Get-NetAdapter | Select-Object Name,InterfaceIndex,MacAddress } catch {}); @{ IPAddresses = $ips; Adapters = $adapters } | ConvertTo-Json -Depth 5 -Compress",
         ],
     ).ok()?;
 
     logger::log_to_file(&format!(
-        "PowerShell IP: exit={}, stdout_len={}, stderr_len={}",
-        ip_output
+        "PowerShell network: exit={}, stdout_len={}, stderr_len={}",
+        output
             .status
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "?".into()),
-        ip_output.stdout.len(),
-        ip_output.stderr.len()
+        output.stdout.len(),
+        output.stderr.len()
     ));
-    if !ip_output.status.success() {
+    if !output.status.success() {
         logger::log_to_file(&format!(
-            "PowerShell IP stderr: {}",
-            encoding::decode(&ip_output.stderr)
+            "PowerShell network stderr: {}",
+            encoding::decode(&output.stderr)
         ));
         return None;
     }
+    parse_powershell_snapshot(&encoding::decode(&output.stdout))
+}
 
-    let ip_json = encoding::decode(&ip_output.stdout);
-    logger::log_to_file(&format!(
-        "PowerShell IP JSON (first 300): {}",
-        ip_json.chars().take(300).collect::<String>()
-    ));
-
-    // Command: Get adapters
-    let ad_output = process::run_command(
-        "powershell",
-        &[
-            "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-            "Get-NetAdapter | Select-Object Name,InterfaceDescription,InterfaceIndex,MacAddress,Status | ConvertTo-Json -Depth 5",
-        ],
-    ).ok()?;
-
-    let ad_json = if ad_output.status.success() {
-        let json = encoding::decode(&ad_output.stdout);
-        logger::log_to_file(&format!(
-            "PowerShell Adapter JSON (first 200): {}",
-            json.chars().take(200).collect::<String>()
-        ));
-        json
-    } else {
-        logger::log_to_file(&format!(
-            "PowerShell Adapter stderr: {}",
-            encoding::decode(&ad_output.stderr)
-        ));
-        String::new()
-    };
-
-    parse_powershell_output(&ip_json, &ad_json)
+fn parse_powershell_snapshot(json: &str) -> Option<Vec<InterfaceInfo>> {
+    let snapshot: serde_json::Value = serde_json::from_str(json).ok()?;
+    let ips = snapshot.get("IPAddresses")?.to_string();
+    let adapters = snapshot
+        .get("Adapters")
+        .filter(|value| !value.is_null())
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    parse_powershell_output(&ips, &adapters)
 }
 
 #[derive(Deserialize)]
@@ -564,6 +544,31 @@ mod tests {
     }
 
     // --- JSON parsing ---
+
+    #[test]
+    fn combined_powershell_snapshot_joins_addresses_and_adapters() {
+        let json = r#"{"IPAddresses":[{"InterfaceAlias":"Ethernet","InterfaceIndex":12,"IPAddress":"192.0.2.10","AddressFamily":2},{"InterfaceAlias":"Ethernet","InterfaceIndex":12,"IPAddress":"2001:db8::10","AddressFamily":23}],"Adapters":[{"Name":"Ethernet","InterfaceIndex":12,"MacAddress":"00-00-5E-00-53-01"}]}"#;
+        let result = parse_powershell_snapshot(json).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].ipv4, "192.0.2.10");
+        assert_eq!(result[0].ipv6, vec!["2001:db8::10"]);
+        assert_eq!(result[0].mac, "00-00-5E-00-53-01");
+    }
+
+    #[test]
+    fn combined_snapshot_handles_missing_adapters_empty_arrays_and_invalid_json() {
+        let json = r#"{"IPAddresses":{"InterfaceAlias":"Ethernet","InterfaceIndex":12,"IPAddress":"192.0.2.10"},"Adapters":null}"#;
+        let result = parse_powershell_snapshot(json).unwrap();
+        assert_eq!(result[0].name, "Ethernet");
+        assert!(result[0].mac.is_empty());
+        assert!(
+            parse_powershell_snapshot(r#"{"IPAddresses":[],"Adapters":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_powershell_snapshot("invalid").is_none());
+        assert!(parse_powershell_snapshot(r#"{"Adapters":[]}"#).is_none());
+    }
 
     #[test]
     fn parse_single_object_json() {
