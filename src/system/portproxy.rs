@@ -3,6 +3,7 @@ use crate::system::{
     encoding,
     process::{CommandExecutor, SystemCommandExecutor},
 };
+use std::net::IpAddr;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RuleDiffAction {
@@ -105,9 +106,15 @@ pub fn parse_show_output(proxy_mode: ProxyMode, output: &str) -> Vec<PortproxyEn
 
             entries.push(PortproxyEntry {
                 proxy_mode,
-                listen_address: parts[0].to_string(),
+                listen_address: parts[0]
+                    .parse::<IpAddr>()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|_| parts[0].to_string()),
                 listen_port,
-                connect_address: parts[2].to_string(),
+                connect_address: parts[2]
+                    .parse::<IpAddr>()
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|_| parts[2].to_string()),
                 connect_port,
             });
         }
@@ -361,6 +368,21 @@ Address         Port        Address         Port
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].listen_address, "::");
         assert_eq!(entries[0].connect_address, "fd00::10");
+    }
+
+    #[test]
+    fn ipv6_identity_is_canonical_without_rewriting_hostnames() {
+        let sample = "---\n\
+0:0:0:0:0:0:0:1 8443 FD00:0:0:0:0:0:0:10 443\n\
+0:0:0:0:0:0:0:0 8080 Service.Example.test 80\n";
+        let entries = parse_show_output(ProxyMode::V6ToV6, sample);
+        assert_eq!(
+            entries,
+            vec![
+                make_entry(ProxyMode::V6ToV6, "::1", 8443, "fd00::10", 443),
+                make_entry(ProxyMode::V6ToV6, "::", 8080, "Service.Example.test", 80),
+            ]
+        );
     }
 
     #[test]

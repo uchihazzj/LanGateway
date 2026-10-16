@@ -12,6 +12,7 @@ const FIREWALL_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct NetworkPanel {
     diagnostic_status: String,
+    diagnostic_result: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
     firewall_statuses: Vec<firewall::FirewallRuleStatus>,
     firewall_signature: String,
     firewall_refreshing: bool,
@@ -25,6 +26,7 @@ impl NetworkPanel {
     pub fn new() -> Self {
         Self {
             diagnostic_status: String::new(),
+            diagnostic_result: None,
             firewall_statuses: Vec::new(),
             firewall_signature: String::new(),
             firewall_refreshing: false,
@@ -45,6 +47,7 @@ impl NetworkPanel {
         i18n: &I18n,
     ) {
         self.apply_firewall_result();
+        self.apply_diagnostic_result(i18n);
 
         ui.heading(i18n.text("network.title"));
 
@@ -95,51 +98,55 @@ impl NetworkPanel {
                 if info.interfaces.is_empty() {
                     ui.label(i18n.text("status.no_adapters"));
                 }
-                egui::Grid::new("network_adapter_grid")
-                    .num_columns(6)
-                    .spacing([10.0, 4.0])
-                    .striped(true)
+                egui::ScrollArea::horizontal()
+                    .id_salt("network_adapters_scroll")
                     .show(ui, |ui| {
-                        ui.strong(i18n.text("status.interface"));
-                        ui.strong("IPv4");
-                        ui.strong("IPv6");
-                        ui.strong("MAC");
-                        ui.strong(i18n.text("network.priority"));
-                        ui.strong(i18n.text("network.flags"));
-                        ui.end_row();
+                        egui::Grid::new("network_adapter_grid")
+                            .num_columns(6)
+                            .spacing([10.0, 4.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.strong(i18n.text("status.interface"));
+                                ui.strong("IPv4");
+                                ui.strong("IPv6");
+                                ui.strong("MAC");
+                                ui.strong(i18n.text("network.priority"));
+                                ui.strong(i18n.text("network.flags"));
+                                ui.end_row();
 
-                        for iface in &info.interfaces {
-                            ui.label(&iface.name);
-                            ui.label(if iface.ipv4.is_empty() {
-                                "-"
-                            } else {
-                                &iface.ipv4
+                                for iface in &info.interfaces {
+                                    ui.label(&iface.name);
+                                    ui.label(if iface.ipv4.is_empty() {
+                                        "-"
+                                    } else {
+                                        &iface.ipv4
+                                    });
+                                    ui.label(if iface.ipv6.is_empty() {
+                                        "-".into()
+                                    } else {
+                                        iface.ipv6.join(", ")
+                                    });
+                                    ui.label(if iface.mac.is_empty() {
+                                        "-"
+                                    } else {
+                                        &iface.mac
+                                    });
+                                    ui.label(network::gateway_ip_priority(&iface.ipv4).to_string());
+                                    let mut flags = Vec::new();
+                                    if iface.is_virtual {
+                                        flags.push(i18n.text("settings.suspected_virtual"));
+                                    }
+                                    if network::is_apipa_ipv4(&iface.ipv4) {
+                                        flags.push(i18n.text("settings.apipa_warning"));
+                                    }
+                                    ui.label(if flags.is_empty() {
+                                        "-".into()
+                                    } else {
+                                        flags.join(", ")
+                                    });
+                                    ui.end_row();
+                                }
                             });
-                            ui.label(if iface.ipv6.is_empty() {
-                                "-".into()
-                            } else {
-                                iface.ipv6.join(", ")
-                            });
-                            ui.label(if iface.mac.is_empty() {
-                                "-"
-                            } else {
-                                &iface.mac
-                            });
-                            ui.label(network::gateway_ip_priority(&iface.ipv4).to_string());
-                            let mut flags = Vec::new();
-                            if iface.is_virtual {
-                                flags.push(i18n.text("settings.suspected_virtual"));
-                            }
-                            if network::is_apipa_ipv4(&iface.ipv4) {
-                                flags.push(i18n.text("settings.apipa_warning"));
-                            }
-                            ui.label(if flags.is_empty() {
-                                "-".into()
-                            } else {
-                                flags.join(", ")
-                            });
-                            ui.end_row();
-                        }
                     });
             });
 
@@ -175,30 +182,60 @@ impl NetworkPanel {
             ui.add_space(10.0);
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.strong(i18n.text("network.diagnostics"));
-                if ui.button(i18n.text("network.export_diagnostics")).clicked() {
-                    let report = diagnostics::build_report(
-                        config,
-                        config_path,
-                        info,
-                        proxy_entries,
-                        mdns_status,
-                    );
-                    match diagnostics::save_report(&report) {
-                        Ok(path) => {
-                            self.diagnostic_status = format!(
-                                "{}: {}",
-                                i18n.text("network.diagnostics_saved"),
-                                path.display()
-                            );
-                        }
-                        Err(e) => self.diagnostic_status = e,
-                    }
+                if ui
+                    .add_enabled(
+                        self.diagnostic_result.is_none(),
+                        egui::Button::new(i18n.text("network.export_diagnostics")),
+                    )
+                    .clicked()
+                {
+                    let config = config.clone();
+                    let config_path = config_path.to_path_buf();
+                    let info = info.clone();
+                    let proxy_entries = proxy_entries.to_vec();
+                    let mdns_status = mdns_status.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.diagnostic_result = Some(rx);
+                    self.diagnostic_status.clear();
+                    std::thread::spawn(move || {
+                        let report = diagnostics::build_report(
+                            &config,
+                            &config_path,
+                            &info,
+                            &proxy_entries,
+                            &mdns_status,
+                        );
+                        let _ = tx.send(diagnostics::save_report(&report));
+                    });
+                }
+                if self.diagnostic_result.is_some() {
+                    ui.spinner();
+                    ui.ctx().request_repaint_after(Duration::from_millis(150));
                 }
                 if !self.diagnostic_status.is_empty() {
                     ui.label(&self.diagnostic_status);
                 }
             });
         });
+    }
+
+    fn apply_diagnostic_result(&mut self, i18n: &I18n) {
+        let Some(rx) = &self.diagnostic_result else {
+            return;
+        };
+        self.diagnostic_status = match rx.try_recv() {
+            Ok(Ok(path)) => format!(
+                "{}: {}",
+                i18n.text("network.diagnostics_saved"),
+                path.display()
+            ),
+            Ok(Err(e)) => e,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                i18n.text("rules.operation_failed").into()
+            }
+        };
+        self.diagnostic_result = None;
     }
 
     fn firewall_rule_names(config: &Config) -> Vec<String> {

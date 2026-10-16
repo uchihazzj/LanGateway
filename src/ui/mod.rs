@@ -3,3 +3,4 @@ pub mod fonts;
 pub mod network;
 pub mod rules;
 pub mod settings;
+pub mod theme;

@@ -128,7 +128,7 @@ impl SettingsPanel {
         );
         egui::Frame::group(ui.style()).show(ui, |ui| {
             let has_ip = !info.gateway_ip.is_empty();
-            ui.add_enabled_ui(has_ip, |ui| {
+            ui.add_enabled_ui(has_ip || self.mdns_enabled, |ui| {
                 ui.checkbox(&mut self.mdns_enabled, i18n.text("settings.mdns_enable"));
             });
             if !has_ip {
@@ -141,6 +141,9 @@ impl SettingsPanel {
             ui.add_space(4.0);
             match &self.mdns_status {
                 MdnsStatus::Disabled => {}
+                MdnsStatus::Starting => {
+                    ui.spinner();
+                }
                 MdnsStatus::Running => {
                     ui.colored_label(egui::Color32::from_rgb(0, 180, 80), "Running");
                 }
@@ -167,11 +170,14 @@ impl SettingsPanel {
                 }
             }
 
-            let hostname = if self.mdns_hostname.is_empty() {
-                "gateway"
-            } else {
-                &self.mdns_hostname
-            };
+            let hostname = crate::service::mdns::validate_mdns_hostname(&self.mdns_hostname)
+                .unwrap_or_else(|_| {
+                    if self.mdns_hostname.trim().is_empty() {
+                        "gateway".into()
+                    } else {
+                        self.mdns_hostname.trim().into()
+                    }
+                });
             ui.label(format!(
                 "{}: {}.local",
                 i18n.text("settings.mdns_display"),

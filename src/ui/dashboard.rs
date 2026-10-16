@@ -26,46 +26,55 @@ impl DashboardPanel {
         let mut need_refresh = false;
         ui.heading(i18n.text("dashboard.title"));
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.set_min_width(400.0);
-            egui::Grid::new("dashboard_grid")
-                .num_columns(2)
-                .spacing([20.0, 8.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label(format!("{}:", i18n.text("dashboard.hostname")));
-                    ui.label(&info.hostname);
-                    ui.end_row();
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style())
+            .fill(egui::Color32::WHITE)
+            .corner_radius(10)
+            .inner_margin(16)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(i18n.text("dashboard.gateway_ip"));
+                let gateway = if info.gateway_ip.is_empty() {
+                    i18n.text("status.no_usable_ipv4")
+                } else {
+                    &info.gateway_ip
+                };
+                ui.label(
+                    egui::RichText::new(gateway)
+                        .size(28.0)
+                        .strong()
+                        .color(crate::ui::theme::ACCENT),
+                );
+                ui.add_space(12.0);
+                egui::Grid::new("dashboard_grid")
+                    .num_columns(2)
+                    .spacing([20.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(format!("{}:", i18n.text("dashboard.hostname")));
+                        ui.label(&info.hostname);
+                        ui.end_row();
 
-                    ui.label(format!("{}:", i18n.text("dashboard.gateway_ip")));
-                    if info.gateway_ip.is_empty() {
-                        ui.strong(i18n.text("status.no_usable_ipv4"));
-                    } else {
-                        ui.strong(&info.gateway_ip);
-                    }
-                    ui.end_row();
+                        ui.label(format!("{}:", i18n.text("dashboard.detected_ipv4")));
+                        ui.label(info.local_ipv4.join(", "));
+                        ui.end_row();
 
-                    ui.label(format!("{}:", i18n.text("dashboard.detected_ipv4")));
-                    ui.label(info.local_ipv4.join(", "));
-                    ui.end_row();
+                        ui.label(format!("{}:", i18n.text("dashboard.active_interface")));
+                        ui.label(&info.active_interface);
+                        ui.end_row();
 
-                    ui.label(format!("{}:", i18n.text("dashboard.active_interface")));
-                    ui.label(&info.active_interface);
-                    ui.end_row();
+                        ui.label(format!("{}:", i18n.text("dashboard.administrator")));
+                        ui.label(if info.is_admin {
+                            i18n.text("status.admin_yes")
+                        } else {
+                            i18n.text("status.admin_no")
+                        });
+                        ui.end_row();
 
-                    ui.label(format!("{}:", i18n.text("dashboard.administrator")));
-                    ui.label(if info.is_admin {
-                        i18n.text("status.admin_yes")
-                    } else {
-                        i18n.text("status.admin_no")
+                        ui.label(format!("{}:", i18n.text("dashboard.portproxy_rules")));
+                        ui.label(info.rule_count.to_string());
+                        ui.end_row();
                     });
-                    ui.end_row();
-
-                    ui.label(format!("{}:", i18n.text("dashboard.portproxy_rules")));
-                    ui.label(info.rule_count.to_string());
-                    ui.end_row();
-                });
-        });
+            });
 
         ui.add_space(12.0);
 
@@ -93,7 +102,14 @@ impl DashboardPanel {
                 need_refresh = true;
             }
 
-            if !info.is_admin && ui.button(i18n.text("dashboard.restart_as_admin")).clicked() {
+            if !info.is_admin
+                && ui
+                    .add_enabled(
+                        !update_status.is_busy(),
+                        egui::Button::new(i18n.text("dashboard.restart_as_admin")),
+                    )
+                    .clicked()
+            {
                 if let Err(e) = privilege::restart_as_admin() {
                     self.elevation_error = Some(e);
                 }
@@ -177,11 +193,7 @@ impl DashboardPanel {
                     if ui.button(i18n.text("dashboard.download_update")).clicked() {
                         *downloading_update = true;
                     }
-                    if ui.button(i18n.text("dashboard.open_release")).clicked() {
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/c", "start", "", release_url])
-                            .spawn();
-                    }
+                    ui.hyperlink_to(i18n.text("dashboard.open_release"), release_url);
                 });
             }
             UpdateStatus::Downloading => {

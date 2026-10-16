@@ -1,4 +1,7 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// State machine for the auto-update flow.
@@ -32,8 +35,8 @@ impl UpdateStatus {
 
 const GITHUB_REPO: &str = "uchihazzj/LanGateway";
 const ASSET_NAME: &str = "langateway.exe";
-const PROCESS_NAME: &str = "langateway";
 const MIN_EXE_SIZE_BYTES: u64 = 102_400;
+static INSTALL_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Proxy strategy order for GitHub requests. Tests assert these choices without
 /// making real network requests.
@@ -59,7 +62,6 @@ struct GitHubAsset {
 #[derive(Debug, serde::Deserialize)]
 struct GitHubRelease {
     tag_name: String,
-    html_url: String,
     #[serde(default)]
     assets: Vec<GitHubAsset>,
 }
@@ -86,6 +88,8 @@ fn build_github_agent(use_proxy: bool, timeout_secs: u64) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(timeout_secs)))
         .http_status_as_error(false)
+        .https_only(true)
+        .max_redirects(5)
         .user_agent(user_agent())
         .proxy(proxy)
         .build()
@@ -129,27 +133,35 @@ fn format_rate_limit_error(
     )
 }
 
-/// Parse version numbers for comparison. Strips leading 'v'.
-fn is_newer(local: &str, remote: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.trim_start_matches('v')
-            .split('.')
-            .map(|s| s.parse::<u32>().unwrap_or(0))
-            .collect()
-    };
-    let a = parse(local);
-    let b = parse(remote);
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let av = a.get(i).copied().unwrap_or(0);
-        let bv = b.get(i).copied().unwrap_or(0);
-        match bv.cmp(&av) {
-            std::cmp::Ordering::Greater => return true,
-            std::cmp::Ordering::Less => return false,
-            std::cmp::Ordering::Equal => continue,
-        }
+fn stable_version(value: &str) -> Result<[u32; 3], String> {
+    let parts: Vec<_> = value
+        .strip_prefix('v')
+        .unwrap_or(value)
+        .split('.')
+        .collect();
+    if parts.len() != 3 {
+        return Err("Release version must be X.Y.Z or vX.Y.Z".into());
     }
-    false
+    let mut version = [0; 3];
+    for (index, part) in parts.into_iter().enumerate() {
+        if part.is_empty()
+            || !part.bytes().all(|c| c.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return Err("Unsupported or invalid stable release version".into());
+        }
+        version[index] = part
+            .parse()
+            .map_err(|_| "Release version number overflow")?;
+    }
+    Ok(version)
+}
+
+fn is_newer(local: &str, remote: &str) -> bool {
+    match (stable_version(local), stable_version(remote)) {
+        (Ok(local), Ok(remote)) => remote > local,
+        _ => false,
+    }
 }
 
 fn do_check_update(use_proxy: bool) -> Result<Option<(String, String, String)>, String> {
@@ -189,11 +201,15 @@ fn do_check_update(use_proxy: bool) -> Result<Option<(String, String, String)>, 
 
     let body = response
         .body_mut()
+        .with_config()
+        .limit(1024 * 1024)
         .read_to_string()
         .map_err(|e| format!("Failed to read response: {}", e))?;
     let release: GitHubRelease =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse release JSON: {}", e))?;
 
+    stable_version(local_version)?;
+    stable_version(&release.tag_name)?;
     if !is_newer(local_version, &release.tag_name) {
         return Ok(None);
     }
@@ -203,10 +219,14 @@ fn do_check_update(use_proxy: bool) -> Result<Option<(String, String, String)>, 
         .iter()
         .find(|a| a.name == ASSET_NAME)
         .ok_or_else(|| format!("No '{}' asset found in release", ASSET_NAME))?;
+    validate_update_source(&asset.browser_download_url, &release.tag_name)?;
 
     Ok(Some((
-        release.tag_name,
-        release.html_url,
+        release.tag_name.clone(),
+        format!(
+            "https://github.com/{}/releases/tag/{}",
+            GITHUB_REPO, release.tag_name
+        ),
         asset.browser_download_url.clone(),
     )))
 }
@@ -247,6 +267,8 @@ fn do_download(download_url: &str, use_proxy: bool) -> Result<Vec<u8>, String> {
 
     response
         .body_mut()
+        .with_config()
+        .limit(64 * 1024 * 1024)
         .read_to_vec()
         .map_err(|e| format!("download read failed: {}", e))
 }
@@ -269,28 +291,49 @@ fn download_asset(download_url: &str) -> Result<Vec<u8>, String> {
     }
 }
 
-fn exe_dir() -> Result<PathBuf, String> {
-    std::env::current_exe()
-        .map_err(|e| format!("Failed to get exe path: {}", e))?
-        .parent()
-        .ok_or_else(|| "Failed to get exe directory".to_string())
-        .map(Path::to_path_buf)
+fn validate_update_source(download_url: &str, version: &str) -> Result<(), String> {
+    stable_version(version)?;
+    let expected = format!(
+        "https://github.com/{}/releases/download/{}/{}",
+        GITHUB_REPO, version, ASSET_NAME
+    );
+    if download_url != expected {
+        return Err("Update asset URL does not belong to this repository and release".into());
+    }
+    Ok(())
 }
 
-fn version_without_v(version: &str) -> &str {
-    version.trim_start_matches('v')
-}
-
-fn download_filename(latest_version: &str) -> String {
-    format!("langateway-v{}.exe", version_without_v(latest_version))
+fn validate_executable(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < MIN_EXE_SIZE_BYTES as usize {
+        return Err(format!(
+            "Downloaded executable is too small ({} bytes)",
+            bytes.len()
+        ));
+    }
+    if !bytes.starts_with(b"MZ") {
+        return Err("Download is not a Windows executable (missing MZ header)".into());
+    }
+    let offset = u32::from_le_bytes(bytes[0x3c..0x40].try_into().unwrap()) as usize;
+    if offset < 0x40 || bytes.get(offset..offset.saturating_add(4)) != Some(b"PE\0\0".as_slice()) {
+        return Err("Download has an invalid PE header".into());
+    }
+    Ok(())
 }
 
 fn write_download(bytes: &[u8], download_path: &Path, final_path: &Path) -> Result<(), String> {
-    if bytes.is_empty() {
-        return Err("Downloaded file is empty (0 bytes)".to_string());
-    }
+    validate_executable(bytes)?;
 
-    std::fs::write(download_path, bytes).map_err(|e| format!("Failed to write download: {}", e))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(download_path)
+        .map_err(|e| format!("Failed to create download: {}", e))?;
+    if let Err(e) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(download_path);
+        return Err(format!("Failed to write download: {}", e));
+    }
+    drop(file);
 
     match std::fs::metadata(download_path) {
         Ok(meta) if meta.len() as usize == bytes.len() => {}
@@ -308,183 +351,301 @@ fn write_download(bytes: &[u8], download_path: &Path, final_path: &Path) -> Resu
         }
     }
 
-    if final_path.exists() {
-        let _ = std::fs::remove_file(final_path);
-    }
-
     std::fs::rename(download_path, final_path).map_err(|e| {
         let _ = std::fs::remove_file(download_path);
         format!("Failed to rename download: {}", e)
     })
 }
 
-/// Download the new exe, write updater.ps1, and exit.
-/// The updater script handles exe replacement after this process exits.
+/// A helper is cancelled if preparation fails or the UI goes away before handoff.
+pub struct PreparedUpdate {
+    helper: Child,
+    committed: bool,
+    _claim: InstallClaim,
+}
+
+impl PreparedUpdate {
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for PreparedUpdate {
+    fn drop(&mut self) {
+        if !self.committed
+            && self.helper.try_wait().ok().flatten().is_none()
+            && self.helper.kill().is_ok()
+        {
+            let _ = self.helper.wait();
+        }
+    }
+}
+
+struct InstallClaim;
+impl InstallClaim {
+    fn acquire() -> Result<Self, String> {
+        INSTALL_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| Self)
+            .map_err(|_| "An update installation is already running".into())
+    }
+}
+impl Drop for InstallClaim {
+    fn drop(&mut self) {
+        INSTALL_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+fn new_job_directory(exe: &Path) -> Result<(String, PathBuf), String> {
+    let directory = exe.parent().ok_or("Executable has no parent directory")?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    for attempt in 0..16 {
+        let job_id = format!("{:032x}", nonce + attempt);
+        let path = directory.join(format!(".update-{job_id}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok((job_id, path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Cannot create update job: {e}")),
+        }
+    }
+    Err("Cannot allocate a unique update directory".into())
+}
+
+fn powershell_path() -> Result<PathBuf, String> {
+    use std::os::windows::ffi::OsStringExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
+    }
+    let mut buffer = vec![0u16; 32768];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return Err("Cannot locate the Windows system directory".into());
+    }
+    Ok(
+        PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]))
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+    )
+}
+
+/// Prepare the existing update flow without terminating the GUI worker thread.
+/// The UI requests real framework closure only after this helper is ready.
 pub fn perform_update<F>(
     download_url: &str,
     latest_version: &str,
     mut set_status: F,
-) -> Result<(), String>
+) -> Result<PreparedUpdate, String>
 where
     F: FnMut(UpdateStatus),
 {
-    let dir = exe_dir()?;
-    let filename = download_filename(latest_version);
-    let download_tmp = dir.join(format!("{}.download", filename));
-    let new_exe = dir.join(&filename);
-    let old_exe = dir.join(ASSET_NAME);
-    let bak_exe = dir.join(format!("{}.bak", ASSET_NAME));
-    let script_path = dir.join("updater.ps1");
-    let updater_log_path = dir.join("updater.log");
-
-    log_update(&format!("Downloading {}", filename));
+    let claim = InstallClaim::acquire()?;
+    validate_update_source(download_url, latest_version)?;
+    if !is_newer(env!("CARGO_PKG_VERSION"), latest_version) {
+        return Err("Update is not newer than the installed version".into());
+    }
+    let installed =
+        std::env::current_exe().map_err(|e| format!("Cannot locate executable: {e}"))?;
+    let (job_id, directory) = new_job_directory(&installed)?;
     let download_bytes = download_asset(download_url)?;
-    write_download(&download_bytes, &download_tmp, &new_exe)?;
-    log_update(&format!(
-        "Downloaded {} bytes to {}",
-        download_bytes.len(),
-        new_exe.display()
-    ));
-
+    write_download(
+        &download_bytes,
+        &directory.join("candidate.download"),
+        &directory.join("candidate.exe"),
+    )?;
     set_status(UpdateStatus::PreparingUpdate);
 
-    let script = updater_script();
-    std::fs::write(&script_path, &script)
-        .map_err(|e| format!("Failed to write updater script: {}", e))?;
-
-    set_status(UpdateStatus::Restarting);
-
-    let script_path_str = script_path.to_string_lossy().to_string();
-    let old_exe_str = old_exe.to_string_lossy().to_string();
-    let new_exe_str = new_exe.to_string_lossy().to_string();
-    let bak_exe_str = bak_exe.to_string_lossy().to_string();
-    let updater_log_str = updater_log_path.to_string_lossy().to_string();
+    let manifest = serde_json::json!({
+        "job_id": job_id,
+        "installed_exe": installed,
+        "parent_pid": std::process::id(),
+        "expected_size": download_bytes.len(),
+        "parent_timeout_ms": 30000,
+        "startup_timeout_ms": 30000,
+        "replace_attempts": 5,
+        "retry_delay_ms": 200
+    });
+    let manifest_path = directory.join("manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("Cannot write updater manifest: {e}"))?;
+    let script_path = directory.join("updater.ps1");
+    std::fs::write(&script_path, updater_script())
+        .map_err(|e| format!("Cannot write updater script: {e}"))?;
 
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("powershell.exe")
+    let helper = std::process::Command::new(powershell_path()?)
+        // Preserve the existing process-local policy choice; enterprise policy
+        // can still block it, in which case readiness fails and the app stays.
         .args([
             "-NoProfile",
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
-            "-WindowStyle",
-            "Hidden",
             "-File",
-            &script_path_str,
-            "-OldExe",
-            &old_exe_str,
-            "-NewExe",
-            &new_exe_str,
-            "-BakExe",
-            &bak_exe_str,
-            "-LogFile",
-            &updater_log_str,
         ])
+        .arg(&script_path)
+        .arg("-ManifestPath")
+        .arg(&manifest_path)
         .creation_flags(0x08000000) // CREATE_NO_WINDOW
         .spawn()
-        .map_err(|e| format!("Failed to launch updater: {}", e))?;
-
-    log_update(&format!(
-        "Updater launched for {}, exiting for self-replacement",
-        latest_version
-    ));
-    std::process::exit(0);
-}
-
-fn updater_script() -> String {
-    // Use string replacement to avoid format!() conflicts with PowerShell syntax.
-    let script = r#"param(
-    [string]$OldExe,
-    [string]$NewExe,
-    [string]$BakExe,
-    [string]$LogFile
-)
-
-$ErrorActionPreference = "Continue"
-
-function Write-Log($msg) {
-    $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    "$stamp $msg" | Out-File -LiteralPath $LogFile -Append -Encoding utf8
-}
-
-Write-Log "Updater started"
-Write-Log "OldExe=$OldExe"
-Write-Log "NewExe=$NewExe"
-Write-Log "BakExe=$BakExe"
-
-if (-not (Test-Path -LiteralPath $NewExe)) {
-    Write-Log "FATAL: NewExe not found at $NewExe"
-    exit 1
-}
-
-$newSize = (Get-Item -LiteralPath $NewExe).Length
-if ($newSize -lt MIN_EXE_SIZE_BYTES) {
-    Write-Log "FATAL: NewExe too small ($newSize bytes), likely corrupt download"
-    exit 1
-}
-Write-Log "NewExe size: $newSize bytes"
-
-Start-Sleep -Seconds 2
-$timeout = 30
-while ($timeout -gt 0) {
-    $proc = Get-Process -Name "PROCESS_NAME" -ErrorAction SilentlyContinue
-    if (-not $proc) { break }
-    Write-Log "Waiting for PROCESS_NAME to exit... ($timeout attempts left)"
-    Start-Sleep -Seconds 1
-    $timeout--
-}
-
-if ($timeout -eq 0) {
-    Write-Log "WARN: process still running after 30 seconds, attempting replacement"
-}
-
-$maxRetries = 5
-$success = $false
-for ($i = 1; $i -le $maxRetries; $i++) {
-    try {
-        if (Test-Path -LiteralPath $OldExe) {
-            Write-Log "Moving $OldExe -> $BakExe (attempt $i)"
-            Move-Item -LiteralPath $OldExe -Destination $BakExe -Force -ErrorAction Stop
+        .map_err(|e| format!("Cannot launch updater: {e}"))?;
+    let mut prepared = PreparedUpdate {
+        helper,
+        committed: false,
+        _claim: claim,
+    };
+    let expected = format!("{job_id}:{}", std::process::id());
+    let ready = directory.join("helper-ready.txt");
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(15) {
+        if let Some(exit) = prepared.helper.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!(
+                "Updater preflight failed ({exit}); see {}",
+                directory.join("updater.log").display()
+            ));
         }
-        Write-Log "Moving $NewExe -> $OldExe (attempt $i)"
-        Move-Item -LiteralPath $NewExe -Destination $OldExe -Force -ErrorAction Stop
-        $success = $true
-        Write-Log "File replacement succeeded"
-        break
-    } catch {
-        Write-Log "ERROR (attempt $i): $_"
-        Start-Sleep -Seconds 2
+        if std::fs::read_to_string(&ready).is_ok_and(|value| value == expected) {
+            log_update("Updater initialized; requesting application shutdown");
+            set_status(UpdateStatus::Restarting);
+            return Ok(prepared);
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
+    Err(format!(
+        "Updater did not initialize; see {}",
+        directory.join("updater.log").display()
+    ))
 }
 
-if (-not $success) {
-    Write-Log "FATAL: all file replacement attempts failed"
-    if ((Test-Path -LiteralPath $BakExe) -and (-not (Test-Path -LiteralPath $OldExe))) {
-        Write-Log "Rolling back: $BakExe -> $OldExe"
-        Move-Item -LiteralPath $BakExe -Destination $OldExe -Force -ErrorAction SilentlyContinue
+fn updater_script() -> &'static str {
+    include_str!("updater.ps1")
+}
+
+/// The restarted child acknowledges successful config loading and first UI frame.
+pub struct StartupReady {
+    path: PathBuf,
+    job_id: String,
+}
+
+impl StartupReady {
+    /// Call on the main thread before starting any worker threads.
+    pub fn capture() -> Result<Option<Self>, String> {
+        let job = std::env::var_os("RUST_APP_UPDATE_JOB_ID");
+        let path = std::env::var_os("RUST_APP_UPDATE_READY_FILE");
+        std::env::remove_var("RUST_APP_UPDATE_JOB_ID");
+        std::env::remove_var("RUST_APP_UPDATE_READY_FILE");
+        let (job, path) = match (job, path) {
+            (None, None) => return Ok(None),
+            (Some(job), Some(path)) => (job, PathBuf::from(path)),
+            _ => return Err("Incomplete update startup environment".into()),
+        };
+        let job_id = job
+            .into_string()
+            .map_err(|_| "Invalid update job identifier")?;
+        let installed = std::env::current_exe().map_err(|e| e.to_string())?;
+        Self::from_paths(&installed, path, job_id).map(Some)
     }
-    exit 1
-}
 
-Write-Log "Starting $OldExe"
-Start-Process -FilePath $OldExe
-Start-Sleep -Seconds 3
+    fn from_paths(installed: &Path, path: PathBuf, job_id: String) -> Result<Self, String> {
+        if job_id.len() != 32
+            || !job_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("Invalid update job identifier".into());
+        }
+        let expected = installed
+            .parent()
+            .ok_or("Executable has no parent")?
+            .join(format!(".update-{job_id}"))
+            .join("ready.txt");
+        if !installed.is_absolute() || path != expected {
+            return Err("Unexpected update startup acknowledgement path".into());
+        }
+        Ok(Self { path, job_id })
+    }
 
-if (Test-Path -LiteralPath $BakExe) {
-    Write-Log "Removing backup $BakExe"
-    Remove-Item -LiteralPath $BakExe -Force -ErrorAction SilentlyContinue
-}
-
-Write-Log "Updater completed successfully"
-Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
-"#;
-    script
-        .replace("PROCESS_NAME", PROCESS_NAME)
-        .replace("MIN_EXE_SIZE_BYTES", &MIN_EXE_SIZE_BYTES.to_string())
+    pub fn acknowledge(self) -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&self.path)
+            .map_err(|e| e.to_string())?;
+        write!(file, "{}:{}", self.job_id, std::process::id()).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_or_prerelease_tags_are_not_offered_as_stable_updates() {
+        for remote in [
+            "v1.2.3-beta.1",
+            "v1.2.3/../../other",
+            "v1.2.invalid",
+            "vv1.2.3",
+            "v01.2.3",
+            "v1.2",
+        ] {
+            assert!(
+                !is_newer("0.3.7", remote),
+                "accepted invalid version: {remote}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_download_preserves_the_previously_staged_file() {
+        let dir = std::env::temp_dir();
+        let staged = dir.join(format!(
+            "langateway-invalid-download-{}.exe",
+            std::process::id()
+        ));
+        let temporary = staged.with_extension("download");
+        std::fs::write(&staged, b"previous staged version").unwrap();
+        let result = write_download(
+            &vec![b'x'; MIN_EXE_SIZE_BYTES as usize],
+            &temporary,
+            &staged,
+        );
+        let contents = std::fs::read(&staged).unwrap();
+        let _ = std::fs::remove_file(&temporary);
+        std::fs::remove_file(&staged).unwrap();
+        assert!(result.is_err());
+        assert_eq!(contents, b"previous staged version");
+    }
+
+    #[test]
+    fn update_source_rejects_other_repositories_and_path_traversal() {
+        let url = "https://github.com/uchihazzj/LanGateway/releases/download/v1.2.3/langateway.exe";
+        assert!(validate_update_source(url, "v1.2.3").is_ok());
+        assert!(validate_update_source(url, "v1.2.3/../../other").is_err());
+        assert!(validate_update_source(&url.replace("LanGateway", "other"), "v1.2.3").is_err());
+        assert!(validate_update_source(&url.replace("https:", "http:"), "v1.2.3").is_err());
+    }
+
+    #[test]
+    fn executable_validation_checks_size_and_pe_pointer_bounds() {
+        assert!(validate_executable(b"MZ").is_err());
+        let mut bytes = vec![0; MIN_EXE_SIZE_BYTES as usize];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(validate_executable(&bytes).is_err());
+        bytes[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        assert!(validate_executable(&bytes).is_err());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        assert!(validate_executable(&bytes).is_ok());
+    }
 
     #[test]
     fn is_newer_detects_minor_bump() {
@@ -566,19 +727,52 @@ mod tests {
     }
 
     #[test]
-    fn download_filename_strips_v_prefix() {
-        assert_eq!(download_filename("v0.3.5"), "langateway-v0.3.5.exe");
-        assert_eq!(download_filename("0.3.5"), "langateway-v0.3.5.exe");
+    fn update_jobs_are_distinct_and_independent_of_the_executable_name() {
+        let exe = std::env::temp_dir().join("renamed tool [test].exe");
+        let (first_id, first) = new_job_directory(&exe).unwrap();
+        let (second_id, second) = new_job_directory(&exe).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first_id, second_id);
+        assert_eq!(first.parent(), exe.parent());
+        std::fs::remove_dir(first).unwrap();
+        std::fs::remove_dir(second).unwrap();
     }
 
     #[test]
-    fn updater_script_contains_log_retry_and_rollback() {
-        let script = updater_script();
-        assert!(script.contains("[string]$LogFile"));
-        assert!(script.contains("$maxRetries = 5"));
-        assert!(script.contains("Rolling back"));
-        assert!(script.contains("102400"));
-        assert!(script.contains("Get-Process -Name \"langateway\""));
+    fn startup_ticket_rejects_unrelated_paths_and_invalid_identifiers() {
+        let installed = std::env::temp_dir().join("renamed.exe");
+        let id = "0123456789abcdef0123456789abcdef";
+        assert!(
+            StartupReady::from_paths(&installed, installed.with_extension("txt"), id.into())
+                .is_err()
+        );
+        assert!(StartupReady::from_paths(
+            &installed,
+            installed.with_extension("txt"),
+            "../escape".into()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn startup_ticket_acknowledges_exact_job_and_process_only_once() {
+        let installed = std::env::temp_dir().join("renamed.exe");
+        let (id, directory) = new_job_directory(&installed).unwrap();
+        let ready = directory.join("ready.txt");
+        StartupReady::from_paths(&installed, ready.clone(), id.clone())
+            .unwrap()
+            .acknowledge()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&ready).unwrap(),
+            format!("{}:{}", id, std::process::id())
+        );
+        assert!(StartupReady::from_paths(&installed, ready.clone(), id)
+            .unwrap()
+            .acknowledge()
+            .is_err());
+        std::fs::remove_file(ready).unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]

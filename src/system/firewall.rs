@@ -34,17 +34,15 @@ fn sanitize_rule_name(value: &str) -> String {
         .collect()
 }
 
-pub fn ensure_tcp_rule(rule: &ForwardRule) -> Result<(), String> {
-    ensure_tcp_rule_with(&SystemCommandExecutor, rule)
-}
-
 pub fn ensure_tcp_rule_with(exec: &dyn CommandExecutor, rule: &ForwardRule) -> Result<(), String> {
     if rule.protocol != ProxyProtocol::Tcp {
         return Err("Windows portproxy firewall automation only supports TCP".into());
     }
 
     let name = tcp_rule_name(rule);
-    delete_rule_with(exec, &name).ok();
+    if query_rule_with(exec, &name).exists {
+        delete_rule_with(exec, &name)?;
+    }
     let port_arg = format!("localport={}", rule.listen_port);
     let name_arg = format!("name={}", name);
     run_firewall_command(
@@ -84,10 +82,6 @@ pub fn ensure_mdns_rule_with(exec: &dyn CommandExecutor) -> Result<(), String> {
             "localport=5353",
         ],
     )
-}
-
-pub fn delete_rule(name: &str) -> Result<(), String> {
-    delete_rule_with(&SystemCommandExecutor, name)
 }
 
 pub fn delete_rule_with(exec: &dyn CommandExecutor, name: &str) -> Result<(), String> {
@@ -189,10 +183,10 @@ mod tests {
         let exec = MockExecutor::default();
         ensure_tcp_rule_with(&exec, &make_rule()).unwrap();
         let calls = exec.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[1].contains(&"protocol=TCP".to_string()));
-        assert!(calls[1].contains(&"localport=8080".to_string()));
-        assert!(calls[1].contains(&"name=LanGateway-web-8080".to_string()));
+        assert_eq!(calls.len(), 3);
+        assert!(calls[2].contains(&"protocol=TCP".to_string()));
+        assert!(calls[2].contains(&"localport=8080".to_string()));
+        assert!(calls[2].contains(&"name=LanGateway-web-8080".to_string()));
     }
 
     #[test]

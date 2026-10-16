@@ -11,6 +11,23 @@ use std::sync::mpsc::Receiver;
 pub struct HealthCheckResult {
     pub health_map: HashMap<usize, HealthStatus>,
     pub orphan_health: HashMap<OrphanKey, HealthStatus>,
+    rules: Vec<ForwardRule>,
+    proxy_entries: Vec<PortproxyEntry>,
+}
+
+enum RuleCompletion {
+    Save(&'static str),
+    Toggle(usize, bool),
+    Delete(usize),
+    Refresh,
+    DeleteOrphan,
+}
+
+struct RuleOperationResult {
+    config: Config,
+    result: Result<Vec<PortproxyEntry>, String>,
+    recovered_entries: Option<Vec<PortproxyEntry>>,
+    completion: RuleCompletion,
 }
 
 pub struct RulesPanel {
@@ -24,7 +41,10 @@ pub struct RulesPanel {
     pub is_admin: bool,
     pub health_check_running: bool,
     pub health_result_rx: Option<Receiver<HealthCheckResult>>,
+    operation_rx: Option<Receiver<RuleOperationResult>>,
+    pub operations_blocked: bool,
     pub editing_rule_index: Option<usize>,
+    pub add_listen_address: String,
     pub add_listen_port: String,
     pub add_connect_address: String,
     pub add_connect_port: String,
@@ -52,7 +72,10 @@ impl RulesPanel {
             is_admin,
             health_check_running: false,
             health_result_rx: None,
+            operation_rx: None,
+            operations_blocked: false,
             editing_rule_index: None,
+            add_listen_address: "0.0.0.0".into(),
             add_listen_port: String::new(),
             add_connect_address: String::new(),
             add_connect_port: String::new(),
@@ -68,6 +91,10 @@ impl RulesPanel {
     }
 
     pub fn apply_proxy_entries(&mut self, entries: Vec<PortproxyEntry>) {
+        if self.proxy_entries == entries {
+            self.update_preflight_notes();
+            return;
+        }
         self.proxy_entries = entries;
         self.health_map.clear();
         for i in 0..self.config.rules.len() {
@@ -78,9 +105,113 @@ impl RulesPanel {
     }
 
     pub fn refresh_proxy(&mut self) {
-        match crate::system::portproxy::show_all() {
-            Ok(entries) => self.apply_proxy_entries(entries),
-            Err(e) => self.status_message = format!("Failed to read rules: {}", e),
+        if let Err(e) = self.start_operation(
+            |_, _| crate::system::portproxy::show_all(),
+            RuleCompletion::Refresh,
+        ) {
+            self.status_message = e;
+        }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.operation_rx.is_some()
+    }
+
+    fn start_operation(
+        &mut self,
+        task: impl FnOnce(&RuleService, &mut Config) -> Result<Vec<PortproxyEntry>, String>
+            + Send
+            + 'static,
+        completion: RuleCompletion,
+    ) -> Result<(), String> {
+        if self.is_busy() || self.operations_blocked {
+            return Err("Another operation is in progress; please wait".into());
+        }
+        let service = self.service.clone();
+        let mut config = self.config.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.operation_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = task(&service, &mut config);
+            let recovered_entries = if result.is_err() {
+                crate::system::portproxy::show_all().ok()
+            } else {
+                None
+            };
+            let _ = tx.send(RuleOperationResult {
+                config,
+                result,
+                recovered_entries,
+                completion,
+            });
+        });
+        Ok(())
+    }
+
+    pub fn apply_operation_results(&mut self, i18n: &I18n) {
+        let Some(rx) = &self.operation_rx else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.operation_rx = None;
+                self.status_message = i18n.text("rules.operation_failed").into();
+                return;
+            }
+        };
+        self.operation_rx = None;
+        match result.result {
+            Ok(entries) => {
+                // Settings can be changed on another page; only the worker's
+                // rules belong to this operation.
+                let rules_changed = self.config.rules != result.config.rules;
+                self.config.rules = result.config.rules;
+                self.apply_proxy_entries(entries);
+                if rules_changed {
+                    self.health_map.clear();
+                    self.orphan_health.clear();
+                }
+                self.status_message = match result.completion {
+                    RuleCompletion::Save(key) => {
+                        self.clear_form();
+                        self.editing_rule_index = None;
+                        i18n.text(key).into()
+                    }
+                    RuleCompletion::Toggle(index, enabled) => {
+                        if self.editing_rule_index == Some(index) {
+                            self.add_enabled = enabled;
+                        }
+                        i18n.text(if enabled {
+                            "msg.rule_enabled"
+                        } else {
+                            "msg.rule_disabled"
+                        })
+                        .into()
+                    }
+                    RuleCompletion::Delete(index) => {
+                        self.adjust_editing_after_delete(index);
+                        String::new()
+                    }
+                    RuleCompletion::Refresh | RuleCompletion::DeleteOrphan => String::new(),
+                };
+            }
+            Err(e) => {
+                if let Some(entries) = result.recovered_entries {
+                    self.apply_proxy_entries(entries);
+                }
+                self.status_message = format!("{}: {}", i18n.text("rules.operation_failed"), e);
+            }
+        }
+    }
+
+    fn adjust_editing_after_delete(&mut self, deleted: usize) {
+        match self.editing_rule_index {
+            Some(index) if index == deleted => {
+                self.clear_form();
+                self.editing_rule_index = None;
+            }
+            Some(index) if index > deleted => self.editing_rule_index = Some(index - 1),
+            _ => {}
         }
     }
 
@@ -100,17 +231,30 @@ impl RulesPanel {
             let _ = tx.send(HealthCheckResult {
                 health_map,
                 orphan_health,
+                rules,
+                proxy_entries,
             });
         });
     }
 
     pub fn apply_health_results(&mut self) {
         if let Some(rx) = &self.health_result_rx {
-            if let Ok(result) = rx.try_recv() {
-                self.health_map = result.health_map;
-                self.orphan_health = result.orphan_health;
-                self.health_check_running = false;
-                self.health_result_rx = None;
+            match rx.try_recv() {
+                Ok(result) => {
+                    if result.rules == self.config.rules
+                        && result.proxy_entries == self.proxy_entries
+                    {
+                        self.health_map = result.health_map;
+                        self.orphan_health = result.orphan_health;
+                    }
+                    self.health_check_running = false;
+                    self.health_result_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.health_check_running = false;
+                    self.health_result_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
     }
@@ -120,7 +264,8 @@ impl RulesPanel {
             .iter()
             .filter(|e| {
                 !self.config.rules.iter().any(|r| {
-                    r.proxy_mode == e.proxy_mode
+                    r.protocol == ProxyProtocol::Tcp
+                        && r.proxy_mode == e.proxy_mode
                         && r.listen_address == e.listen_address
                         && r.listen_port == e.listen_port
                         && r.connect_address == e.connect_address
@@ -132,12 +277,11 @@ impl RulesPanel {
 
     pub fn add_rule(&mut self, i18n: &I18n) -> Result<(), String> {
         let form = self.parse_form(i18n)?;
-        let entries =
-            self.service
-                .add_rule(&mut self.config, &self.proxy_entries, form, self.is_admin)?;
-        self.apply_proxy_entries(entries);
-        self.clear_form();
-        Ok(())
+        let admin = self.is_admin;
+        self.start_operation(
+            move |service, config| service.add_rule(config, form, admin),
+            RuleCompletion::Save("msg.rule_added"),
+        )
     }
 
     pub fn update_rule(&mut self, i18n: &I18n) -> Result<(), String> {
@@ -145,17 +289,11 @@ impl RulesPanel {
             .editing_rule_index
             .ok_or_else(|| i18n.text("err.invalid_rule_index").to_string())?;
         let form = self.parse_form(i18n)?;
-        let entries = self.service.update_rule(
-            &mut self.config,
-            &self.proxy_entries,
-            idx,
-            form,
-            self.is_admin,
-        )?;
-        self.apply_proxy_entries(entries);
-        self.clear_form();
-        self.editing_rule_index = None;
-        Ok(())
+        let admin = self.is_admin;
+        self.start_operation(
+            move |service, config| service.update_rule(config, idx, form, admin),
+            RuleCompletion::Save("msg.rule_updated"),
+        )
     }
 
     pub fn toggle_rule_enabled(
@@ -167,18 +305,11 @@ impl RulesPanel {
         if index >= self.config.rules.len() {
             return Err(i18n.text("err.invalid_rule_index").to_string());
         }
-        let entries = self.service.set_rule_enabled(
-            &mut self.config,
-            &self.proxy_entries,
-            index,
-            enabled,
-            self.is_admin,
-        )?;
-        if self.editing_rule_index == Some(index) {
-            self.add_enabled = enabled;
-        }
-        self.apply_proxy_entries(entries);
-        Ok(())
+        let admin = self.is_admin;
+        self.start_operation(
+            move |service, config| service.set_rule_enabled(config, index, enabled, admin),
+            RuleCompletion::Toggle(index, enabled),
+        )
     }
 
     pub fn adopt_orphan(&mut self, orphan_index: usize, i18n: &I18n) -> Result<(), String> {
@@ -212,25 +343,24 @@ impl RulesPanel {
         if index >= self.config.rules.len() {
             return Err(i18n.text("err.invalid_rule_index").to_string());
         }
-        let entries = self
-            .service
-            .delete_rule(&mut self.config, index, self.is_admin)?;
-        if self.editing_rule_index == Some(index) {
-            self.clear_form();
-            self.editing_rule_index = None;
-        }
-        self.apply_proxy_entries(entries);
-        Ok(())
+        let admin = self.is_admin;
+        self.start_operation(
+            move |service, config| service.delete_rule(config, index, admin),
+            RuleCompletion::Delete(index),
+        )
     }
 
     pub fn delete_orphan(&mut self, orphan_index: usize, i18n: &I18n) -> Result<(), String> {
         let orphans: Vec<PortproxyEntry> = self.orphan_entries().into_iter().cloned().collect();
         let entry = orphans
             .get(orphan_index)
-            .ok_or_else(|| i18n.text("err.invalid_orphan_index").to_string())?;
-        let entries = self.service.delete_orphan(entry, self.is_admin)?;
-        self.apply_proxy_entries(entries);
-        Ok(())
+            .ok_or_else(|| i18n.text("err.invalid_orphan_index").to_string())?
+            .clone();
+        let admin = self.is_admin;
+        self.start_operation(
+            move |service, _| service.delete_orphan(&entry, admin),
+            RuleCompletion::DeleteOrphan,
+        )
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, i18n: &I18n) {
@@ -238,59 +368,72 @@ impl RulesPanel {
         ui.heading(i18n.text("rules.title"));
 
         if !self.status_message.is_empty() {
-            ui.colored_label(egui::Color32::from_rgb(220, 80, 60), &self.status_message);
-            self.status_message.clear();
-        }
-
-        if !self.last_preflight.is_empty() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.strong(i18n.text("rules.preflight"));
-                for item in &self.last_preflight {
-                    ui.label(item);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&self.status_message);
+                if ui.small_button("×").clicked() {
+                    self.status_message.clear();
                 }
             });
-            ui.add_space(8.0);
         }
+        if self.is_busy() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(i18n.text("rules.working"));
+            });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        ui.add_enabled_ui(!self.is_busy() && !self.operations_blocked, |ui| {
+            if !self.last_preflight.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.strong(i18n.text("rules.preflight"));
+                    for item in &self.last_preflight {
+                        ui.label(item);
+                    }
+                });
+                ui.add_space(8.0);
+            }
 
-        ui.strong(i18n.text("rules.managed"));
-        self.show_rules_table(ui, i18n);
+            ui.strong(i18n.text("rules.managed"));
+            self.show_rules_table(ui, i18n);
 
-        let orphans: Vec<PortproxyEntry> = self.orphan_entries().into_iter().cloned().collect();
-        if !orphans.is_empty() {
+            let orphans: Vec<PortproxyEntry> = self.orphan_entries().into_iter().cloned().collect();
+            if !orphans.is_empty() {
+                ui.add_space(12.0);
+                ui.strong(i18n.text("rules.orphan"));
+                self.show_orphan_table(ui, &orphans, i18n);
+            }
+
             ui.add_space(12.0);
-            ui.strong(i18n.text("rules.orphan"));
-            self.show_orphan_table(ui, &orphans, i18n);
-        }
+            ui.separator();
+            ui.add_space(8.0);
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        if self.editing_rule_index.is_some() {
-            ui.heading(i18n.text("rules.edit_rule"));
-        } else {
-            ui.heading(i18n.text("rules.add_new"));
-        }
-        self.show_add_form(ui, i18n);
-
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            if ui.button(i18n.text("rules.refresh")).clicked() {
-                self.clear_form();
-                self.editing_rule_index = None;
-                self.refresh_proxy();
-            }
-            let label = if self.health_check_running {
-                "..."
+            if self.editing_rule_index.is_some() {
+                ui.heading(i18n.text("rules.edit_rule"));
             } else {
-                i18n.text("dashboard.run_health_check")
-            };
-            if ui
-                .add_enabled(!self.health_check_running, egui::Button::new(label))
-                .clicked()
-            {
-                self.run_health_checks_background();
+                ui.heading(i18n.text("rules.add_new"));
             }
+            self.show_add_form(ui, i18n);
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n.text("rules.refresh")).clicked() {
+                    self.clear_form();
+                    self.editing_rule_index = None;
+                    self.refresh_proxy();
+                }
+                let label = if self.health_check_running {
+                    "..."
+                } else {
+                    i18n.text("dashboard.run_health_check")
+                };
+                if ui
+                    .add_enabled(!self.health_check_running, egui::Button::new(label))
+                    .clicked()
+                {
+                    self.run_health_checks_background();
+                }
+            });
         });
     }
 
@@ -304,89 +447,89 @@ impl RulesPanel {
         let mut edit_idx = None;
         let mut toggle_idx = None;
 
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                egui::Grid::new("rules_grid")
-                    .num_columns(10)
-                    .spacing([8.0, 4.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong(i18n.text("col.name"));
-                        ui.strong(i18n.text("col.mode"));
-                        ui.strong(i18n.text("col.listen_addr"));
-                        ui.strong(i18n.text("col.listen_port"));
-                        ui.strong(i18n.text("col.connect_addr"));
-                        ui.strong(i18n.text("col.connect_port"));
-                        ui.strong(i18n.text("col.flags"));
-                        ui.strong(i18n.text("col.notes"));
-                        ui.strong(i18n.text("col.health"));
-                        ui.strong(i18n.text("col.action"));
-                        ui.end_row();
+        egui::ScrollArea::horizontal()
+            .id_salt("managed_rules_scroll")
+            .show(ui, |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    egui::Grid::new("rules_grid")
+                        .num_columns(10)
+                        .spacing([8.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong(i18n.text("col.name"));
+                            ui.strong(i18n.text("col.mode"));
+                            ui.strong(i18n.text("col.listen_addr"));
+                            ui.strong(i18n.text("col.listen_port"));
+                            ui.strong(i18n.text("col.connect_addr"));
+                            ui.strong(i18n.text("col.connect_port"));
+                            ui.strong(i18n.text("col.flags"));
+                            ui.strong(i18n.text("col.notes"));
+                            ui.strong(i18n.text("col.health"));
+                            ui.strong(i18n.text("col.action"));
+                            ui.end_row();
 
-                        for (i, rule) in self.config.rules.iter().enumerate() {
-                            ui.label(&rule.name);
-                            ui.label(format!(
-                                "{} {}",
-                                rule.protocol.label(),
-                                rule.proxy_mode.label()
-                            ));
-                            ui.label(&rule.listen_address);
-                            ui.label(rule.listen_port.to_string());
-                            ui.label(&rule.connect_address);
-                            ui.label(rule.connect_port.to_string());
-                            ui.label(rule_flags(rule));
-                            ui.label(&rule.notes);
+                            for (i, rule) in self.config.rules.iter().enumerate() {
+                                ui.label(&rule.name);
+                                ui.label(format!(
+                                    "{} {}",
+                                    rule.protocol.label(),
+                                    rule.proxy_mode.label()
+                                ));
+                                ui.label(&rule.listen_address);
+                                ui.label(rule.listen_port.to_string());
+                                ui.label(&rule.connect_address);
+                                ui.label(rule.connect_port.to_string());
+                                ui.label(rule_flags(rule));
+                                ui.label(&rule.notes);
 
-                            let health =
-                                self.health_map.get(&i).unwrap_or(&HealthStatus::NotChecked);
-                            ui.colored_label(health.color(), health.label(self.config.language))
+                                let health =
+                                    self.health_map.get(&i).unwrap_or(&HealthStatus::NotChecked);
+                                ui.colored_label(
+                                    health.color(),
+                                    health.label(self.config.language),
+                                )
                                 .on_hover_text(health.detail());
 
-                            ui.horizontal(|ui| {
-                                let toggle_label = if rule.enabled {
-                                    i18n.text("btn.disable")
-                                } else {
-                                    i18n.text("btn.enable")
-                                };
-                                if ui
-                                    .add_enabled(self.is_admin, egui::Button::new(toggle_label))
-                                    .clicked()
-                                {
-                                    toggle_idx = Some((i, !rule.enabled));
-                                }
-                                if ui
-                                    .add_enabled(
-                                        self.is_admin,
-                                        egui::Button::new(i18n.text("btn.edit")),
-                                    )
-                                    .clicked()
-                                {
-                                    edit_idx = Some(i);
-                                }
-                                if ui
-                                    .add_enabled(
-                                        self.is_admin,
-                                        egui::Button::new(i18n.text("btn.delete")),
-                                    )
-                                    .clicked()
-                                {
-                                    delete_idx = Some(i);
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
+                                ui.horizontal(|ui| {
+                                    let toggle_label = if rule.enabled {
+                                        i18n.text("btn.disable")
+                                    } else {
+                                        i18n.text("btn.enable")
+                                    };
+                                    if ui
+                                        .add_enabled(self.is_admin, egui::Button::new(toggle_label))
+                                        .clicked()
+                                    {
+                                        toggle_idx = Some((i, !rule.enabled));
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.is_admin,
+                                            egui::Button::new(i18n.text("btn.edit")),
+                                        )
+                                        .clicked()
+                                    {
+                                        edit_idx = Some(i);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.is_admin,
+                                            egui::Button::new(i18n.text("btn.delete")),
+                                        )
+                                        .clicked()
+                                    {
+                                        delete_idx = Some(i);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
             });
-        });
 
         if let Some((i, enabled)) = toggle_idx {
             match self.toggle_rule_enabled(i, enabled, i18n) {
-                Ok(()) if enabled => {
-                    self.status_message = i18n.text("msg.rule_enabled").into();
-                }
-                Ok(()) => {
-                    self.status_message = i18n.text("msg.rule_disabled").into();
-                }
+                Ok(()) => self.status_message = i18n.text("rules.working").into(),
                 Err(e) => {
                     self.status_message = format!("{}: {}", i18n.text("msg.rule_add_failed"), e);
                 }
@@ -416,56 +559,61 @@ impl RulesPanel {
         });
         ui.add_space(4.0);
 
-        egui::ScrollArea::horizontal().show(ui, |ui| {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                egui::Grid::new("orphan_grid")
-                    .num_columns(7)
-                    .spacing([8.0, 4.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong(i18n.text("col.mode"));
-                        ui.strong(i18n.text("col.listen_addr"));
-                        ui.strong(i18n.text("col.listen_port"));
-                        ui.strong(i18n.text("col.connect_addr"));
-                        ui.strong(i18n.text("col.connect_port"));
-                        ui.strong(i18n.text("col.health"));
-                        ui.strong(i18n.text("col.action"));
-                        ui.end_row();
+        egui::ScrollArea::horizontal()
+            .id_salt("orphan_rules_scroll")
+            .show(ui, |ui| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    egui::Grid::new("orphan_grid")
+                        .num_columns(7)
+                        .spacing([8.0, 4.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong(i18n.text("col.mode"));
+                            ui.strong(i18n.text("col.listen_addr"));
+                            ui.strong(i18n.text("col.listen_port"));
+                            ui.strong(i18n.text("col.connect_addr"));
+                            ui.strong(i18n.text("col.connect_port"));
+                            ui.strong(i18n.text("col.health"));
+                            ui.strong(i18n.text("col.action"));
+                            ui.end_row();
 
-                        for (i, entry) in orphans.iter().enumerate() {
-                            ui.label(entry.proxy_mode.label());
-                            ui.label(&entry.listen_address);
-                            ui.label(entry.listen_port.to_string());
-                            ui.label(&entry.connect_address);
-                            ui.label(entry.connect_port.to_string());
+                            for (i, entry) in orphans.iter().enumerate() {
+                                ui.label(entry.proxy_mode.label());
+                                ui.label(&entry.listen_address);
+                                ui.label(entry.listen_port.to_string());
+                                ui.label(&entry.connect_address);
+                                ui.label(entry.connect_port.to_string());
 
-                            let key = OrphanKey::from_entry(entry);
-                            let status = self
-                                .orphan_health
-                                .get(&key)
-                                .unwrap_or(&HealthStatus::NotChecked);
-                            ui.colored_label(status.color(), status.label(self.config.language))
+                                let key = OrphanKey::from_entry(entry);
+                                let status = self
+                                    .orphan_health
+                                    .get(&key)
+                                    .unwrap_or(&HealthStatus::NotChecked);
+                                ui.colored_label(
+                                    status.color(),
+                                    status.label(self.config.language),
+                                )
                                 .on_hover_text(status.detail());
 
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(
-                                        self.is_admin,
-                                        egui::Button::new(i18n.text("btn.delete")),
-                                    )
-                                    .clicked()
-                                {
-                                    delete_idx = Some(i);
-                                }
-                                if ui.button(i18n.text("btn.adopt")).clicked() {
-                                    adopt_idx = Some(i);
-                                }
-                            });
-                            ui.end_row();
-                        }
-                    });
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add_enabled(
+                                            self.is_admin,
+                                            egui::Button::new(i18n.text("btn.delete")),
+                                        )
+                                        .clicked()
+                                    {
+                                        delete_idx = Some(i);
+                                    }
+                                    if ui.button(i18n.text("btn.adopt")).clicked() {
+                                        adopt_idx = Some(i);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
             });
-        });
 
         if let Some(i) = delete_idx {
             if let Err(e) = self.delete_orphan(i, i18n) {
@@ -502,11 +650,16 @@ impl RulesPanel {
                     ui.label(format!("{}:", i18n.text("form.protocol")));
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.add_protocol, ProxyProtocol::Tcp, "TCP");
-                        ui.radio_value(&mut self.add_protocol, ProxyProtocol::Udp, "UDP");
+                        ui.add_enabled(
+                            false,
+                            egui::RadioButton::new(self.add_protocol == ProxyProtocol::Udp, "UDP"),
+                        )
+                        .on_hover_text(i18n.text("rules.udp_note"));
                     });
                     ui.end_row();
 
                     ui.label(format!("{}:", i18n.text("form.proxy_mode")));
+                    let previous_mode = self.add_proxy_mode;
                     egui::ComboBox::from_id_salt("proxy_mode_combo")
                         .selected_text(self.add_proxy_mode.label())
                         .show_ui(ui, |ui| {
@@ -514,10 +667,18 @@ impl RulesPanel {
                                 ui.selectable_value(&mut self.add_proxy_mode, *mode, mode.label());
                             }
                         });
+                    if self.add_proxy_mode != previous_mode
+                        && self.add_listen_address == previous_mode.listen_any_address()
+                    {
+                        self.add_listen_address = self.add_proxy_mode.listen_any_address().into();
+                    }
                     ui.end_row();
 
                     ui.label(format!("{}:", i18n.text("form.listen_addr")));
-                    ui.label(self.add_proxy_mode.listen_any_address());
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.add_listen_address)
+                            .desired_width(220.0),
+                    );
                     ui.end_row();
 
                     ui.label(format!("{}:", i18n.text("form.listen_port")));
@@ -559,7 +720,11 @@ impl RulesPanel {
                     &mut self.add_firewall_managed,
                     i18n.text("form.firewall_managed"),
                 );
-                ui.checkbox(&mut self.add_mdns_publish, i18n.text("form.mdns_publish"));
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut self.add_mdns_publish, i18n.text("form.mdns_publish")),
+                )
+                .on_hover_text(i18n.text("form.mdns_publish_note"));
             });
 
             if self.add_protocol == ProxyProtocol::Udp {
@@ -574,13 +739,13 @@ impl RulesPanel {
                 if is_editing {
                     if ui
                         .add_enabled(
-                            self.is_admin,
+                            self.is_admin && self.add_protocol == ProxyProtocol::Tcp,
                             egui::Button::new(i18n.text("btn.update_rule")),
                         )
                         .clicked()
                     {
                         match self.update_rule(i18n) {
-                            Ok(()) => self.status_message = i18n.text("msg.rule_updated").into(),
+                            Ok(()) => self.status_message = i18n.text("rules.working").into(),
                             Err(e) => {
                                 self.status_message =
                                     format!("{}: {}", i18n.text("msg.rule_add_failed"), e);
@@ -592,11 +757,14 @@ impl RulesPanel {
                         self.editing_rule_index = None;
                     }
                 } else if ui
-                    .add_enabled(self.is_admin, egui::Button::new(i18n.text("btn.add_rule")))
+                    .add_enabled(
+                        self.is_admin && self.add_protocol == ProxyProtocol::Tcp,
+                        egui::Button::new(i18n.text("btn.add_rule")),
+                    )
                     .clicked()
                 {
                     match self.add_rule(i18n) {
-                        Ok(()) => self.status_message = i18n.text("msg.rule_added").into(),
+                        Ok(()) => self.status_message = i18n.text("rules.working").into(),
                         Err(e) => {
                             self.status_message =
                                 format!("{}: {}", i18n.text("msg.rule_add_failed"), e);
@@ -613,10 +781,12 @@ impl RulesPanel {
     fn parse_form(&self, i18n: &I18n) -> Result<RuleForm, String> {
         let listen_port: u16 = self
             .add_listen_port
+            .trim()
             .parse()
             .map_err(|_| i18n.text("err.invalid_listen_port").to_string())?;
         let connect_port: u16 = self
             .add_connect_port
+            .trim()
             .parse()
             .map_err(|_| i18n.text("err.invalid_connect_port").to_string())?;
         if self.add_connect_address.trim().is_empty() {
@@ -629,7 +799,7 @@ impl RulesPanel {
                 .unwrap_or_default(),
             name: self.add_name.clone(),
             notes: self.add_notes.clone(),
-            listen_address: self.add_proxy_mode.listen_any_address().to_string(),
+            listen_address: self.add_listen_address.clone(),
             listen_port,
             connect_address: self.add_connect_address.clone(),
             connect_port,
@@ -649,6 +819,7 @@ impl RulesPanel {
 
     fn load_rule_into_form(&mut self, index: usize) {
         if let Some(rule) = self.config.rules.get(index) {
+            self.add_listen_address = rule.listen_address.clone();
             self.add_listen_port = rule.listen_port.to_string();
             self.add_connect_address = rule.connect_address.clone();
             self.add_connect_port = rule.connect_port.to_string();
@@ -665,6 +836,7 @@ impl RulesPanel {
     }
 
     fn clear_form(&mut self) {
+        self.add_listen_address = "0.0.0.0".into();
         self.add_listen_port.clear();
         self.add_connect_address.clear();
         self.add_connect_port.clear();
@@ -732,6 +904,22 @@ mod tests {
     use super::*;
     use crate::core::model::{Language, PortproxyEntry};
 
+    #[test]
+    fn editing_an_adopted_rule_preserves_its_listen_address() {
+        let mut panel = make_panel();
+        panel.proxy_entries = vec![make_entry(
+            ProxyMode::V4ToV4,
+            "127.0.0.1",
+            8080,
+            "127.0.0.1",
+            80,
+        )];
+        panel.adopt_orphan(0, &I18n::new(Language::EnUs)).unwrap();
+        panel.load_rule_into_form(0);
+        let form = panel.parse_form(&I18n::new(Language::EnUs)).unwrap();
+        assert_eq!(form.listen_address, "127.0.0.1");
+    }
+
     fn make_entry(
         mode: ProxyMode,
         listen_addr: &str,
@@ -749,7 +937,12 @@ mod tests {
     }
 
     fn make_panel() -> RulesPanel {
-        let tmp = std::env::temp_dir().join("langateway_test_config.toml");
+        static NEXT_PANEL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = std::env::temp_dir().join(format!(
+            "langateway-panel-{}-{}.toml",
+            std::process::id(),
+            NEXT_PANEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let config = Config {
             rules: vec![],
             mdns_enabled: false,
@@ -760,6 +953,118 @@ mod tests {
         let mut panel = RulesPanel::new(config, tmp, false);
         panel.apply_proxy_entries(vec![]);
         panel
+    }
+
+    #[test]
+    fn deleting_an_earlier_row_keeps_the_same_rule_in_the_editor() {
+        let mut panel = make_panel();
+        panel.editing_rule_index = Some(2);
+        panel.add_name = "edited third rule".into();
+        panel.adjust_editing_after_delete(0);
+        assert_eq!(panel.editing_rule_index, Some(1));
+        assert_eq!(panel.add_name, "edited third rule");
+        panel.adjust_editing_after_delete(1);
+        assert_eq!(panel.editing_rule_index, None);
+        assert!(panel.add_name.is_empty());
+    }
+
+    #[test]
+    fn health_results_from_a_previous_rules_snapshot_are_discarded() {
+        let mut panel = make_panel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        panel.health_result_rx = Some(rx);
+        panel.health_check_running = true;
+        tx.send(HealthCheckResult {
+            health_map: HashMap::from([(0, HealthStatus::Healthy)]),
+            orphan_health: HashMap::new(),
+            rules: Vec::new(),
+            proxy_entries: vec![make_entry(
+                ProxyMode::V4ToV4,
+                "0.0.0.0",
+                9999,
+                "127.0.0.1",
+                80,
+            )],
+        })
+        .unwrap();
+        panel.apply_health_results();
+        assert!(panel.health_map.is_empty());
+        assert!(!panel.health_check_running);
+    }
+
+    #[test]
+    fn disconnected_health_worker_does_not_leave_the_panel_busy() {
+        let mut panel = make_panel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        panel.health_result_rx = Some(rx);
+        panel.health_check_running = true;
+        drop(tx);
+        panel.apply_health_results();
+        assert!(!panel.health_check_running);
+        assert!(panel.health_result_rx.is_none());
+    }
+
+    #[test]
+    fn operation_results_are_applied_without_replacing_other_settings() {
+        let mut panel = make_panel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        panel.operation_rx = Some(rx);
+        let worker_config = panel.config.clone();
+        panel.config.preferred_gateway_ip = "192.0.2.10".into();
+        tx.send(RuleOperationResult {
+            config: worker_config,
+            result: Ok(vec![]),
+            recovered_entries: None,
+            completion: RuleCompletion::Refresh,
+        })
+        .unwrap();
+        panel.apply_operation_results(&I18n::new(Language::EnUs));
+        assert_eq!(panel.config.preferred_gateway_ip, "192.0.2.10");
+        assert!(!panel.is_busy());
+    }
+
+    #[test]
+    fn operations_run_off_the_ui_thread_and_reject_concurrent_commands() {
+        let mut panel = make_panel();
+        let ui_thread = std::thread::current().id();
+        panel
+            .start_operation(
+                move |_, _| {
+                    assert_ne!(std::thread::current().id(), ui_thread);
+                    Ok(vec![])
+                },
+                RuleCompletion::Refresh,
+            )
+            .unwrap();
+        assert!(panel
+            .start_operation(|_, _| Ok(vec![]), RuleCompletion::Refresh)
+            .is_err());
+        let result = panel
+            .operation_rx
+            .take()
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(result.result.is_ok());
+    }
+
+    #[test]
+    fn unchanged_refresh_preserves_health_results() {
+        let mut panel = make_panel();
+        let entries = vec![make_entry(
+            ProxyMode::V4ToV4,
+            "0.0.0.0",
+            8080,
+            "127.0.0.1",
+            80,
+        )];
+        panel.apply_proxy_entries(entries.clone());
+        let key = OrphanKey::from_entry(&entries[0]);
+        panel
+            .orphan_health
+            .insert(key.clone(), HealthStatus::Healthy);
+        panel.apply_proxy_entries(entries);
+        assert_eq!(panel.orphan_health.get(&key), Some(&HealthStatus::Healthy));
     }
 
     #[test]

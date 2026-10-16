@@ -12,7 +12,7 @@ const DNS_TTL_SECS: u32 = 30;
 const RECV_BUF_LEN: usize = 1500;
 
 // ---------------------------------------------------------------------------
-// Snapshot / status — public API unchanged
+// Snapshot / status
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +31,7 @@ impl MdnsConfigSnapshot {
 #[derive(Debug, Clone)]
 pub enum MdnsStatus {
     Disabled,
+    Starting,
     Running,
     Failed(String),
     #[allow(dead_code)]
@@ -42,11 +43,78 @@ impl fmt::Display for MdnsStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MdnsStatus::Disabled => write!(f, "Disabled"),
+            MdnsStatus::Starting => write!(f, "Starting"),
             MdnsStatus::Running => write!(f, "Running"),
             MdnsStatus::Failed(e) => write!(f, "Failed: {}", e),
             MdnsStatus::Conflict(e) => write!(f, "Conflict: {}", e),
             MdnsStatus::WaitingForIp => write!(f, "Waiting for usable IP"),
         }
+    }
+}
+
+/// Own the socket lifecycle on one worker so restarting or stopping mDNS never
+/// waits for PowerShell or the responder's read timeout on the UI thread.
+pub struct MdnsController {
+    commands: std::sync::mpsc::Sender<MdnsConfigSnapshot>,
+    results: std::sync::mpsc::Receiver<(MdnsConfigSnapshot, MdnsStatus)>,
+}
+
+impl MdnsController {
+    pub fn new() -> Self {
+        let (commands, requests) = std::sync::mpsc::channel::<MdnsConfigSnapshot>();
+        let (updates, results) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut handle: Option<MdnsHandle> = None;
+            while let Ok(mut snapshot) = requests.recv() {
+                while let Ok(latest) = requests.try_recv() {
+                    snapshot = latest;
+                }
+                if let Some(previous) = handle.take() {
+                    previous.shutdown();
+                }
+                let status = if !snapshot.enabled {
+                    MdnsStatus::Disabled
+                } else if snapshot.gateway_ip.is_empty() {
+                    MdnsStatus::WaitingForIp
+                } else {
+                    match validate_mdns_hostname(&snapshot.hostname)
+                        .and_then(|hostname| MdnsHandle::start(&hostname, &snapshot.gateway_ip))
+                    {
+                        Ok(next) => {
+                            if let Err(e) = crate::system::firewall::ensure_mdns_rule() {
+                                crate::system::logger::log_to_file(&format!(
+                                    "mDNS firewall rule setup failed: {}",
+                                    e
+                                ));
+                            }
+                            handle = Some(next);
+                            MdnsStatus::Running
+                        }
+                        Err(e) => {
+                            crate::system::logger::log_to_file(&format!(
+                                "mDNS: start failed: {}",
+                                e
+                            ));
+                            MdnsStatus::Failed(e)
+                        }
+                    }
+                };
+                if updates.send((snapshot, status)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { commands, results }
+    }
+
+    pub fn configure(&self, snapshot: MdnsConfigSnapshot) -> Result<(), String> {
+        self.commands
+            .send(snapshot)
+            .map_err(|_| "mDNS worker stopped".into())
+    }
+
+    pub fn try_result(&self) -> Option<(MdnsConfigSnapshot, MdnsStatus)> {
+        self.results.try_recv().ok()
     }
 }
 
@@ -59,7 +127,12 @@ pub fn validate_mdns_hostname(input: &str) -> Result<String, String> {
     if raw.is_empty() {
         return Err("Hostname must not be empty".into());
     }
-    let label = if let Some(stripped) = raw.strip_suffix(".local") {
+    let suffix_start = raw.len().saturating_sub(6);
+    let label = if raw
+        .get(suffix_start..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".local"))
+    {
+        let stripped = &raw[..suffix_start];
         if stripped.contains('.') {
             return Err("mDNS names must be a single label under .local".into());
         }
@@ -109,7 +182,6 @@ pub fn validate_mdns_hostname(input: &str) -> Result<String, String> {
 
 /// Encode a dot-separated name (e.g. "uchihazzj.local") into DNS label format,
 /// including the trailing root label (zero byte).
-#[cfg(test)]
 fn encode_dns_name(name: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     let trimmed = name.trim_end_matches('.');
@@ -119,23 +191,6 @@ fn encode_dns_name(name: &str) -> Vec<u8> {
     }
     buf.push(0);
     buf
-}
-
-/// Find the byte after the name starting at `start`.  Returns `start` on parse
-/// failure so the caller can bail out.
-fn skip_dns_name(data: &[u8], start: usize) -> usize {
-    let mut pos = start;
-    while pos < data.len() {
-        let len = data[pos] as usize;
-        if len == 0 {
-            return pos + 1;
-        }
-        if len & 0xC0 == 0xC0 {
-            return pos + 2; // compression pointer
-        }
-        pos += 1 + len;
-    }
-    start
 }
 
 /// Returns true if `data[offset..]` contains a label-encoded name matching
@@ -173,64 +228,43 @@ fn dns_name_matches(data: &[u8], offset: usize, target: &str) -> bool {
     false
 }
 
-/// Build an mDNS A-record *response* for a query.
-///
-/// `query`: raw bytes of the incoming query packet.
-/// `ip`: dotted IPv4 string for the answer.
-fn build_a_response(query: &[u8], ip: &str) -> Vec<u8> {
-    let ip_bytes: Vec<u8> = ip
-        .split('.')
-        .map(|s| s.parse::<u8>().unwrap_or(0))
-        .collect();
-
-    let tx_id = if query.len() >= 2 {
-        [query[0], query[1]]
-    } else {
-        [0u8, 0]
+/// Build an A response for our own host. A legacy query echoes its transaction
+/// ID and question; regular mDNS and TTL-zero goodbyes contain only the answer.
+fn build_a_response(
+    host_fqdn: &str,
+    ip: &str,
+    tx_id: u16,
+    legacy_question: Option<(u16, u16)>,
+    ttl: u32,
+) -> Vec<u8> {
+    let Ok(ip) = ip.parse::<Ipv4Addr>() else {
+        return Vec::new();
     };
-
-    // Locate the question name end in the query so we can copy the whole
-    // question section verbatim.
-    let qname_end = skip_dns_name(query, 12);
-    let qsection_end = qname_end + 4; // QTYPE + QCLASS
-
-    let mut resp = Vec::with_capacity(qsection_end + 16);
-
-    // ------- Header (12 bytes) --------
-    resp.extend_from_slice(&tx_id); // Transaction ID (echo)
-    resp.push(0x84); // QR=1, OPCODE=0, AA=1, TC=0, RD=0
-    resp.push(0x00); // RA=0, Z=0, RCODE=0
-    resp.extend_from_slice(&[0x00, 0x01]); // QDCOUNT = 1
-    resp.extend_from_slice(&[0x00, 0x01]); // ANCOUNT = 1
-    resp.extend_from_slice(&[0x00, 0x00]); // NSCOUNT
-    resp.extend_from_slice(&[0x00, 0x00]); // ARCOUNT
-
-    // ------- Question (copy from query) --------
-    if qsection_end <= query.len() {
-        resp.extend_from_slice(&query[12..qsection_end]);
+    let name = encode_dns_name(host_fqdn);
+    let mut resp = Vec::new();
+    resp.extend_from_slice(&tx_id.to_be_bytes());
+    resp.extend_from_slice(&[0x84, 0x00]);
+    resp.extend_from_slice(&u16::from(legacy_question.is_some()).to_be_bytes());
+    resp.extend_from_slice(&[0, 1, 0, 0, 0, 0]);
+    if let Some((qtype, qclass)) = legacy_question {
+        resp.extend_from_slice(&name);
+        resp.extend_from_slice(&qtype.to_be_bytes());
+        resp.extend_from_slice(&qclass.to_be_bytes());
     }
-
-    // ------- Answer --------
-    resp.extend_from_slice(&[0xC0, 0x0C]); // name pointer to offset 12
-    resp.extend_from_slice(&[0x00, 0x01]); // TYPE A
-    resp.extend_from_slice(&[0x80, 0x01]); // CLASS IN + cache-flush
-    let ttl = DNS_TTL_SECS.to_be_bytes();
-    resp.extend_from_slice(&ttl);
-    resp.extend_from_slice(&[0x00, 0x04]); // RDLEN = 4
-    resp.extend_from_slice(&ip_bytes);
-
-    resp
-}
-
-/// Build a "goodbye" response (TTL=0).
-fn build_goodbye(query: &[u8], ip: &str) -> Vec<u8> {
-    let mut resp = build_a_response(query, ip);
-    // Overwrite TTL in the answer section: name_ptr(2) + type(2) + class(2) come before TTL(4).
-    let qname_end = skip_dns_name(query, 12);
-    let ttl_off = 12 + (qname_end + 4 - 12) + 2 + 2 + 2;
-    if ttl_off + 4 <= resp.len() {
-        resp[ttl_off..ttl_off + 4].copy_from_slice(&0u32.to_be_bytes());
-    }
+    // Encode the owned hostname, never a question or compression pointer copied
+    // from an untrusted packet (which may contain several different questions).
+    resp.extend_from_slice(&name);
+    resp.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+    let class: u16 = if legacy_question.is_some() { 1 } else { 0x8001 };
+    resp.extend_from_slice(&class.to_be_bytes());
+    let ttl = if legacy_question.is_some() {
+        ttl.min(10)
+    } else {
+        ttl
+    };
+    resp.extend_from_slice(&ttl.to_be_bytes());
+    resp.extend_from_slice(&4u16.to_be_bytes());
+    resp.extend_from_slice(&ip.octets());
     resp
 }
 
@@ -276,6 +310,8 @@ fn create_mdns_socket(interface_ip: &str) -> Result<UdpSocket, String> {
 
     sock.set_multicast_ttl_v4(255)
         .map_err(|e| format!("set multicast TTL: {}", e))?;
+    sock.set_multicast_if_v4(&gateway)
+        .map_err(|e| format!("set multicast interface: {}", e))?;
 
     // Don't receive our own multicast packets.
     sock.set_multicast_loop_v4(false)
@@ -400,7 +436,7 @@ fn responder_loop(socket: UdpSocket, host_fqdn: &str, ip: &str, stop: &AtomicBoo
 
     loop {
         if stop.load(Ordering::SeqCst) {
-            let goodbye = build_goodbye(&[], ip);
+            let goodbye = build_a_response(host_fqdn, ip, 0, None, 0);
             let _ = socket.send_to(&goodbye, multicast_dest);
             crate::system::logger::log_to_file("mDNS: goodbye sent, responder exiting");
             return;
@@ -505,8 +541,9 @@ fn process_queries(
         // Sample (deduplicate by name + type + class_base).
         let qname_lower = qname.to_lowercase();
         let sample_key = (qname_lower.clone(), qtype, qclass_base);
-        let entry = sampled.entry(sample_key).or_insert(0);
-        *entry += 1;
+        if sampled.len() < 512 || sampled.contains_key(&sample_key) {
+            *sampled.entry(sample_key).or_insert(0) += 1;
+        }
 
         // ----- matching -----
         let name_match = qname_lower == our_fqdn || qname_lower == our_fqdn_dot;
@@ -517,12 +554,21 @@ fn process_queries(
         }
 
         match qtype {
-            DNS_TYPE_A => {
+            DNS_TYPE_A | 255 => {
                 // A query — respond.
-                let resp = build_a_response(data, ip);
+                // RFC 6762 section 6.7: clients using an ephemeral source port
+                // require a legacy unicast response, even without the QU bit.
+                let legacy = src.port() != MDNS_PORT;
+                let tx_id = if legacy {
+                    u16::from_be_bytes([data[0], data[1]])
+                } else {
+                    0
+                };
+                let question = legacy.then_some((qtype, qclass_raw));
+                let resp = build_a_response(host_fqdn, ip, tx_id, question, DNS_TTL_SECS);
                 // If the query requested a unicast response, reply directly;
                 // otherwise multicast.
-                let dest = if has_uc {
+                let dest = if has_uc || legacy {
                     src
                 } else {
                     SocketAddrV4::new(MDNS_MULTICAST_V4, MDNS_PORT)
@@ -566,11 +612,14 @@ fn decode_dns_name(data: &[u8], offset: usize) -> Option<(String, usize)> {
     let mut pos = offset;
     let mut jumped = false;
     let mut jump_target = offset;
+    let mut steps = 0;
+    let mut name_len = 1; // terminating root label
 
     loop {
-        if pos >= data.len() {
+        if pos >= data.len() || steps >= data.len() {
             return None;
         }
+        steps += 1;
         let len = data[pos] as usize;
         if len == 0 {
             if !jumped {
@@ -593,6 +642,10 @@ fn decode_dns_name(data: &[u8], offset: usize) -> Option<(String, usize)> {
             jumped = true;
             continue;
         }
+        if len & 0xC0 != 0 || name_len + 1 + len > 255 {
+            return None;
+        }
+        name_len += 1 + len;
         if pos + 1 + len > data.len() {
             return None;
         }
@@ -665,6 +718,114 @@ fn get_5353_owner_info() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_response_and_goodbye_name_the_owned_host() {
+        let legacy = build_a_response(
+            "gateway.local",
+            "192.0.2.10",
+            0xabcd,
+            Some((1, 1)),
+            DNS_TTL_SECS,
+        );
+        let (question, end) = decode_dns_name(&legacy, 12).unwrap();
+        let (answer, answer_end) = decode_dns_name(&legacy, end + 4).unwrap();
+        assert_eq!(question, "gateway.local");
+        assert_eq!(answer, question);
+        assert_eq!(&legacy[0..2], &[0xab, 0xcd]);
+        assert_eq!(&legacy[answer_end + 2..answer_end + 4], &[0, 1]);
+        assert_eq!(
+            u32::from_be_bytes(legacy[answer_end + 4..answer_end + 8].try_into().unwrap()),
+            10
+        );
+        let goodbye = build_a_response("gateway.local", "192.0.2.10", 0, None, 0);
+        assert_eq!(&goodbye[4..8], &[0, 0, 0, 1]);
+        let (name, end) = decode_dns_name(&goodbye, 12).unwrap();
+        assert_eq!(name, "gateway.local");
+        assert_eq!(&goodbye[end + 4..end + 8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn multi_question_queries_answer_only_the_matching_host_by_unicast() {
+        let responder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let src = match client.local_addr().unwrap() {
+            std::net::SocketAddr::V4(addr) => addr,
+            _ => unreachable!(),
+        };
+        let mut query = vec![0; 12];
+        query[0..2].copy_from_slice(&0xabcd_u16.to_be_bytes());
+        query[4..6].copy_from_slice(&2u16.to_be_bytes());
+        for name in ["unrelated.local", "gateway.local"] {
+            query.extend_from_slice(&encode_dns_name(name));
+            query.extend_from_slice(&[0, 1, 0, 1]);
+        }
+        let mut responses = 0;
+        let mut samples = std::collections::HashMap::new();
+        assert!(process_queries(
+            &query,
+            "gateway.local",
+            "192.0.2.10",
+            &responder,
+            &mut responses,
+            &mut samples,
+            src
+        ));
+        let mut buf = [0; 1500];
+        let (len, _) = client.recv_from(&mut buf).unwrap();
+        let (name, next) = decode_dns_name(&buf[..len], 12).unwrap();
+        let (answer, _) = decode_dns_name(&buf[..len], next + 4).unwrap();
+        assert_eq!(name, "gateway.local");
+        assert_eq!(answer, name);
+        assert_eq!(responses, 1);
+    }
+
+    #[test]
+    fn disabled_mdns_ignores_invalid_hostnames_without_network_setup() {
+        let controller = MdnsController::new();
+        controller
+            .configure(MdnsConfigSnapshot {
+                enabled: false,
+                hostname: "invalid.example.com".into(),
+                gateway_ip: "192.0.2.10".into(),
+            })
+            .unwrap();
+        let (_, status) = controller
+            .results
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(status, MdnsStatus::Disabled));
+        assert_eq!(validate_mdns_hostname("Gateway.LOCAL").unwrap(), "Gateway");
+    }
+
+    #[test]
+    fn dns_decoder_rejects_compression_cycles_without_hanging() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let results = [
+                decode_dns_name(&[0xc0, 0], 0),
+                decode_dns_name(&[0xc0, 2, 0xc0, 0], 0),
+            ];
+            let _ = tx.send(results);
+        });
+        let results = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("DNS decoder hung on a compression cycle");
+        assert!(results.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn dns_decoder_rejects_reserved_label_types_and_overlong_names() {
+        let mut invalid_label = vec![64];
+        invalid_label.extend_from_slice(&[b'a'; 64]);
+        invalid_label.push(0);
+        assert!(decode_dns_name(&invalid_label, 0).is_none());
+        let overlong = encode_dns_name(&vec!["a".repeat(63); 5].join("."));
+        assert!(decode_dns_name(&overlong, 0).is_none());
+    }
 
     // --- hostname validation ---
 
@@ -838,7 +999,13 @@ mod tests {
         query.extend_from_slice(&[0x00, 0x01]); // QTYPE A
         query.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
 
-        let resp = build_a_response(&query, "10.108.18.68");
+        let resp = build_a_response(
+            "uchihazzj.local",
+            "192.0.2.10",
+            0xABCD,
+            Some((1, 1)),
+            DNS_TTL_SECS,
+        );
 
         // TXID should be echoed
         assert_eq!(resp[0], 0xAB);

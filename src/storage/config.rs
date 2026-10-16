@@ -1,5 +1,6 @@
 use crate::core::model::{ForwardRule, Language};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn default_preferred_gateway_ip() -> String {
@@ -59,11 +60,11 @@ impl Config {
 
     /// Load config from `path`, returning default if file doesn't exist.
     pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-        let content =
-            std::fs::read_to_string(path).map_err(|e| format!("Failed to read config: {}", e))?;
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Err(e) => return Err(format!("Failed to read config: {}", e)),
+        };
         let mut config: Config =
             toml::from_str(&content).map_err(|e| format!("Failed to parse config: {}", e))?;
         config.normalize();
@@ -72,7 +73,7 @@ impl Config {
 
     /// Save config to `path`. Creates parent directory if needed.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             if !parent.exists() {
                 std::fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create directory: {}", e))?;
@@ -80,7 +81,34 @@ impl Config {
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize config: {}", e))?;
-        std::fs::write(path, content).map_err(|e| format!("Failed to write config: {}", e))
+        static NEXT_SAVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut filename = path
+            .file_name()
+            .ok_or("Config path must name a file")?
+            .to_os_string();
+        filename.push(format!(
+            ".{}.{}.tmp",
+            std::process::id(),
+            NEXT_SAVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let temporary = path.with_file_name(filename);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|e| format!("Failed to create temporary config: {}", e))?;
+        let result = (|| -> std::io::Result<()> {
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            // Same-directory rename replaces the old file only after the new
+            // contents are complete. https://doc.rust-lang.org/std/fs/fn.rename.html
+            std::fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.map_err(|e| format!("Failed to write config: {}", e))
     }
 
     /// Primary entry point: load from C:\ProgramData\LanGateway\config.toml.
@@ -119,14 +147,33 @@ impl Config {
     }
 
     pub fn normalize(&mut self) {
+        let mut ids = std::collections::HashSet::new();
         for rule in &mut self.rules {
             if rule.listen_address.trim().is_empty() {
                 rule.listen_address = rule.proxy_mode.listen_any_address().to_string();
             }
+            rule.listen_address = rule
+                .listen_address
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|_| rule.listen_address.trim().to_string());
+            rule.connect_address = rule
+                .connect_address
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|_| rule.connect_address.trim().to_string());
             if rule.name.trim().is_empty() {
                 rule.name = format!("Rule-{}", rule.listen_port);
             }
             rule.ensure_id();
+            let base = rule.id.clone();
+            let mut suffix = 2;
+            while !ids.insert(rule.id.clone()) {
+                rule.id = format!("{}-{}", base, suffix);
+                suffix += 1;
+            }
         }
     }
 }
@@ -335,5 +382,41 @@ connect_port = 8080
         // config_path() should succeed even if ProgramData\LanGateway doesn't exist yet
         let path = Config::config_path();
         assert!(path.is_ok());
+    }
+
+    #[test]
+    fn saving_replaces_an_existing_config_without_leaving_temporary_files() {
+        let dir =
+            std::env::temp_dir().join(format!("langateway-atomic-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.save(&path).unwrap();
+        config.mdns_hostname = "gateway".into();
+        config.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().mdns_hostname, "gateway");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn normalize_gives_duplicate_rules_distinct_stable_ids() {
+        let text = r#"[[rules]]
+id = "same-id"
+name = "first"
+notes = ""
+listen_address = "0.0.0.0"
+listen_port = 8080
+connect_address = "127.0.0.1"
+connect_port = 80
+"#;
+        let mut config: Config = toml::from_str(text).unwrap();
+        config.rules.push(config.rules[0].clone());
+        config.normalize();
+        let rules = config.rules.clone();
+        assert_ne!(rules[0].id, rules[1].id);
+        config.normalize();
+        assert_eq!(rules, config.rules);
     }
 }

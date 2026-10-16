@@ -78,7 +78,7 @@ fn get_interfaces_via_powershell() -> Option<Vec<InterfaceInfo>> {
     let ip_json = encoding::decode(&ip_output.stdout);
     logger::log_to_file(&format!(
         "PowerShell IP JSON (first 300): {}",
-        &ip_json[..ip_json.len().min(300)]
+        ip_json.chars().take(300).collect::<String>()
     ));
 
     // Command: Get adapters
@@ -94,7 +94,7 @@ fn get_interfaces_via_powershell() -> Option<Vec<InterfaceInfo>> {
         let json = encoding::decode(&ad_output.stdout);
         logger::log_to_file(&format!(
             "PowerShell Adapter JSON (first 200): {}",
-            &json[..json.len().min(200)]
+            json.chars().take(200).collect::<String>()
         ));
         json
     } else {
@@ -263,18 +263,6 @@ fn parse_ipconfig_interfaces(text: &str) -> Vec<InterfaceInfo> {
         let trimmed = line.trim();
 
         if trimmed.is_empty() {
-            if !current_name.is_empty() && !current_ipv4.is_empty() {
-                interfaces.push(InterfaceInfo {
-                    name: current_name.clone(),
-                    ipv4: current_ipv4.clone(),
-                    ipv6: Vec::new(),
-                    mac: current_mac.clone(),
-                    is_virtual: is_virtual_adapter(&current_name),
-                });
-            }
-            current_name.clear();
-            current_ipv4.clear();
-            current_mac.clear();
             continue;
         }
 
@@ -333,7 +321,7 @@ pub fn ipv4_addresses_from(interfaces: &[InterfaceInfo]) -> Vec<String> {
     interfaces
         .iter()
         .map(|i| i.ipv4.clone())
-        .filter(|ip| ip != "0.0.0.0" && seen.insert(ip.clone()))
+        .filter(|ip| ip.parse::<Ipv4Addr>().is_ok() && ip != "0.0.0.0" && seen.insert(ip.clone()))
         .collect()
 }
 
@@ -549,6 +537,21 @@ pub fn get_interface_for_ip<'a>(ip: &str, interfaces: &'a [InterfaceInfo]) -> &'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipconfig_preserves_adapter_across_blank_lines() {
+        let text = "Windows IP Configuration\n\nEthernet adapter Ethernet:\n\n   Physical Address. . . . . . . . . : AA-BB-CC-DD-EE-FF\n   IPv4 Address. . . . . . . . . . . : 192.168.1.10(Preferred)\n\nWireless LAN adapter Wi-Fi:\n\n   IPv4 Address. . . . . . . . . . . : 10.0.0.10(Preferred)\n";
+        let interfaces = parse_ipconfig_interfaces(text);
+        assert_eq!(interfaces.len(), 2);
+        assert_eq!(interfaces[0].ipv4, "192.168.1.10");
+        assert_eq!(interfaces[0].mac, "AA-BB-CC-DD-EE-FF");
+        assert_eq!(interfaces[1].ipv4, "10.0.0.10");
+    }
+
+    #[test]
+    fn ipv4_addresses_exclude_empty_ipv6_only_adapters() {
+        assert!(ipv4_addresses_from(&[make_iface("IPv6 only", "", false)]).is_empty());
+    }
 
     fn make_iface(name: &str, ip: &str, is_virtual: bool) -> InterfaceInfo {
         InterfaceInfo {

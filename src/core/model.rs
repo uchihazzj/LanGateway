@@ -90,7 +90,7 @@ fn default_rule_enabled() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForwardRule {
     #[serde(default)]
     pub id: String,

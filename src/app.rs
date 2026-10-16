@@ -4,11 +4,11 @@ use std::time::{Duration, Instant};
 
 use crate::core::model::{DashboardInfo, Language, PortproxyEntry, RefreshState};
 use crate::i18n::I18n;
-use crate::service::mdns::{self, MdnsConfigSnapshot, MdnsHandle};
+use crate::service::mdns::{self, MdnsConfigSnapshot, MdnsController};
 use crate::service::state::{AppState, OperationState, SharedState};
 use crate::service::update::{self, UpdateStatus};
 use crate::storage::config::Config;
-use crate::system::{firewall, logger, network, portproxy, privilege};
+use crate::system::{logger, network, portproxy, privilege};
 use crate::ui::{
     dashboard::DashboardPanel, fonts, network::NetworkPanel, rules::RulesPanel,
     settings::SettingsPanel,
@@ -24,9 +24,28 @@ enum Tab {
 
 /// Bundled result from a background refresh stage.
 struct RefreshResult {
+    generation: u64,
     info: DashboardInfo,
     proxy_entries: Option<Vec<PortproxyEntry>>,
     complete: bool,
+}
+
+fn should_apply_refresh(generation: u64, state: &RefreshState, result: &RefreshResult) -> bool {
+    result.generation == generation
+        && (result.complete || matches!(state, RefreshState::Refreshing { .. }))
+}
+
+fn merge_quick_entries(
+    mut quick: Vec<PortproxyEntry>,
+    previous: &[PortproxyEntry],
+) -> Vec<PortproxyEntry> {
+    quick.extend(
+        previous
+            .iter()
+            .filter(|entry| entry.proxy_mode != crate::core::model::ProxyMode::V4ToV4)
+            .cloned(),
+    );
+    quick
 }
 
 pub struct LanGatewayApp {
@@ -42,9 +61,13 @@ pub struct LanGatewayApp {
     config: Config,
     refresh_pending: Arc<Mutex<VecDeque<RefreshResult>>>,
     update_status: Arc<Mutex<UpdateStatus>>,
-    mdns_handle: Option<MdnsHandle>,
+    update_result: Option<std::sync::mpsc::Receiver<Result<update::PreparedUpdate, String>>>,
+    startup_ready: Option<update::StartupReady>,
+    mdns_controller: MdnsController,
     last_mdns_snapshot: MdnsConfigSnapshot,
-    last_mdns_failure: Option<String>,
+    refresh_generation: u64,
+    config_load_error: Option<String>,
+    close_after_operation: bool,
     initial_refresh_done: bool,
     initial_health_started: bool,
     initial_update_check_done: bool,
@@ -54,12 +77,15 @@ pub struct LanGatewayApp {
 impl LanGatewayApp {
     /// Two-phase init: fast setup first, then background thread for heavy lifting.
     /// This ensures the first frame renders quickly with a "refreshing" placeholder.
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        startup_ready: Option<update::StartupReady>,
+    ) -> Self {
         logger::log_to_file("=== LanGateway started ===");
 
         // Load config from C:\ProgramData\LanGateway\config.toml
         // Auto-migrates from exe-adjacent config.toml if present
-        let (config, config_path) = match Config::load_or_migrate() {
+        let (config, config_path, config_load_error) = match Config::load_or_migrate() {
             Ok((cfg, migration_msg)) => {
                 let path = Config::config_path().unwrap_or_else(|_| {
                     std::path::PathBuf::from("C:\\ProgramData\\LanGateway\\config.toml")
@@ -72,17 +98,18 @@ impl LanGatewayApp {
                 if let Some(msg) = migration_msg {
                     logger::log_to_file(&msg);
                 }
-                (cfg, path)
+                (cfg, path, None)
             }
             Err(e) => {
                 logger::log_to_file(&format!("Config load failed: {}, using defaults", e));
                 let path = Config::config_path().unwrap_or_else(|_| {
                     std::path::PathBuf::from("C:\\ProgramData\\LanGateway\\config.toml")
                 });
-                (Config::default(), path)
+                (Config::default(), path, Some(e))
             }
         };
         let language = config.language;
+        crate::ui::theme::apply(&cc.egui_ctx);
 
         let font_ok = fonts::setup_fonts(&cc.egui_ctx);
         if !font_ok {
@@ -123,7 +150,7 @@ impl LanGatewayApp {
         let refresh_pending: Arc<Mutex<VecDeque<RefreshResult>>> =
             Arc::new(Mutex::new(VecDeque::new()));
 
-        Self::spawn_refresh_workers(config.clone(), refresh_pending.clone());
+        Self::spawn_refresh_workers(config.clone(), refresh_pending.clone(), 0);
 
         let state = Arc::new(Mutex::new(AppState::new(
             config.clone(),
@@ -144,13 +171,17 @@ impl LanGatewayApp {
             config,
             refresh_pending,
             update_status: Arc::new(Mutex::new(UpdateStatus::Idle)),
-            mdns_handle: None,
+            update_result: None,
+            startup_ready,
+            mdns_controller: MdnsController::new(),
             last_mdns_snapshot: MdnsConfigSnapshot {
                 enabled: false,
                 hostname: String::new(),
                 gateway_ip: String::new(),
             },
-            last_mdns_failure: None,
+            refresh_generation: 0,
+            config_load_error,
+            close_after_operation: false,
             initial_refresh_done: false,
             initial_health_started: false,
             initial_update_check_done: false,
@@ -158,15 +189,23 @@ impl LanGatewayApp {
         }
     }
 
-    fn spawn_refresh_workers(config: Config, pending: Arc<Mutex<VecDeque<RefreshResult>>>) {
+    fn spawn_refresh_workers(
+        config: Config,
+        pending: Arc<Mutex<VecDeque<RefreshResult>>>,
+        generation: u64,
+    ) {
         let quick_cfg = config.clone();
         let quick_pending = pending.clone();
         std::thread::spawn(move || {
-            Self::push_refresh_result(&quick_pending, Self::build_quick_dashboard_info(&quick_cfg));
+            let mut result = Self::build_quick_dashboard_info(&quick_cfg);
+            result.generation = generation;
+            Self::push_refresh_result(&quick_pending, result);
         });
 
         std::thread::spawn(move || {
-            Self::push_refresh_result(&pending, Self::build_full_dashboard_info(&config));
+            let mut result = Self::build_full_dashboard_info(&config);
+            result.generation = generation;
+            Self::push_refresh_result(&pending, result);
         });
     }
 
@@ -183,27 +222,29 @@ impl LanGatewayApp {
         let interfaces = network::get_quick_interfaces();
         let ipv4s = network::ipv4_addresses_from(&interfaces);
         let usable_ipv4s = network::usable_gateway_ipv4_addresses(&interfaces);
-        let proxy_entries = portproxy::show_v4tov4().unwrap_or_else(|e| {
-            logger::log_to_file(&format!("Quick refresh: netsh v4tov4 failed: {}", e));
-            vec![]
-        });
+        let proxy_entries = portproxy::show_v4tov4()
+            .map_err(|e| {
+                logger::log_to_file(&format!("Quick refresh: netsh v4tov4 failed: {}", e));
+            })
+            .ok();
         let gateway_ip =
             network::select_preferred_ip(&ipv4s, &config.preferred_gateway_ip, &interfaces);
         let active_interface = network::get_interface_for_ip(&gateway_ip, &interfaces).to_string();
 
         RefreshResult {
+            generation: 0,
             info: DashboardInfo {
                 hostname,
                 local_ipv4: usable_ipv4s,
                 local_ipv6: Vec::new(),
                 active_interface,
                 is_admin,
-                rule_count: proxy_entries.len(),
+                rule_count: proxy_entries.as_ref().map_or(0, Vec::len),
                 gateway_ip,
                 interfaces,
                 refresh_state: RefreshState::Refreshing { stage: "details" },
             },
-            proxy_entries: Some(proxy_entries),
+            proxy_entries,
             complete: false,
         }
     }
@@ -216,10 +257,13 @@ impl LanGatewayApp {
         let ipv4s = network::ipv4_addresses_from(&interfaces);
         let ipv6s = network::ipv6_addresses_from(&interfaces);
         let usable_ipv4s = network::usable_gateway_ipv4_addresses(&interfaces);
-        let proxy_entries = portproxy::show_all().unwrap_or_else(|e| {
-            logger::log_to_file(&format!("Background refresh: netsh show all failed: {}", e));
-            vec![]
-        });
+        let (proxy_entries, proxy_error) = match portproxy::show_all() {
+            Ok(entries) => (Some(entries), None),
+            Err(e) => {
+                logger::log_to_file(&format!("Background refresh: netsh show all failed: {}", e));
+                (None, Some(e))
+            }
+        };
 
         let gateway_ip =
             network::select_preferred_ip(&ipv4s, &config.preferred_gateway_ip, &interfaces);
@@ -231,27 +275,31 @@ impl LanGatewayApp {
             gateway_ip,
             ipv4s,
             is_admin,
-            proxy_entries.len()
+            proxy_entries.as_ref().map_or(0, Vec::len)
         ));
 
         RefreshResult {
+            generation: 0,
             info: DashboardInfo {
                 hostname,
                 local_ipv4: usable_ipv4s,
                 local_ipv6: ipv6s,
                 active_interface,
                 is_admin,
-                rule_count: proxy_entries.len(),
+                rule_count: proxy_entries.as_ref().map_or(0, Vec::len),
                 gateway_ip,
                 interfaces,
-                refresh_state: RefreshState::Done { error: None },
+                refresh_state: RefreshState::Done { error: proxy_error },
             },
-            proxy_entries: Some(proxy_entries),
+            proxy_entries,
             complete: true,
         }
     }
 
     fn start_background_refresh(&mut self) {
+        if self.rules_panel.is_busy() {
+            return;
+        }
         if matches!(
             self.dashboard_info.refresh_state,
             RefreshState::Refreshing { .. }
@@ -264,7 +312,12 @@ impl LanGatewayApp {
             state.add_log("Refresh started");
         }
 
-        Self::spawn_refresh_workers(self.effective_config(), self.refresh_pending.clone());
+        self.refresh_generation += 1;
+        Self::spawn_refresh_workers(
+            self.effective_config(),
+            self.refresh_pending.clone(),
+            self.refresh_generation,
+        );
     }
 
     /// Apply completed background refresh. Returns true if this was the initial refresh.
@@ -278,6 +331,13 @@ impl LanGatewayApp {
         }
 
         for result in results {
+            if !should_apply_refresh(
+                self.refresh_generation,
+                &self.dashboard_info.refresh_state,
+                &result,
+            ) {
+                continue;
+            }
             let mut info = result.info;
             // If old state had interfaces but new state is empty, retain old network data
             if info.interfaces.is_empty() && !self.dashboard_info.interfaces.is_empty() {
@@ -290,13 +350,24 @@ impl LanGatewayApp {
                 info.gateway_ip = self.dashboard_info.gateway_ip.clone();
                 info.active_interface = self.dashboard_info.active_interface.clone();
                 if result.complete {
-                    info.refresh_state = RefreshState::Done {
-                        error: Some("Network detection failed, showing cached data".into()),
-                    };
+                    if let RefreshState::Done { error } = &mut info.refresh_state {
+                        let cached = "Network detection failed, showing cached data";
+                        *error =
+                            Some(error.as_ref().map_or_else(
+                                || cached.to_string(),
+                                |e| format!("{}; {}", e, cached),
+                            ));
+                    }
                 }
             }
             self.dashboard_info = info;
+            self.recompute_gateway_ip_from_ui();
             if let Some(proxy_entries) = result.proxy_entries {
+                let proxy_entries = if result.complete {
+                    proxy_entries
+                } else {
+                    merge_quick_entries(proxy_entries, &self.rules_panel.proxy_entries)
+                };
                 self.rules_panel.apply_proxy_entries(proxy_entries);
             }
             self.rules_panel.is_admin = self.dashboard_info.is_admin;
@@ -358,95 +429,68 @@ impl LanGatewayApp {
     }
 
     fn sync_mdns_state_impl(&mut self, force: bool) {
-        // Validate hostname first; fall back to "gateway" if empty
-        let raw = if self.settings_panel.mdns_hostname.is_empty() {
-            "gateway"
-        } else {
-            &self.settings_panel.mdns_hostname
-        };
-        let hostname = match mdns::validate_mdns_hostname(raw) {
-            Ok(h) => h,
-            Err(e) => {
-                logger::log_to_file(&format!("mDNS: hostname validation failed: {}", e));
-                self.settings_panel.mdns_status =
-                    mdns::MdnsStatus::Failed(format!("Invalid hostname: {}", e));
-                if let Some(h) = self.mdns_handle.take() {
-                    h.shutdown();
-                }
-                return;
+        while let Some((snapshot, status)) = self.mdns_controller.try_result() {
+            if snapshot == self.last_mdns_snapshot {
+                self.settings_panel.mdns_status = status;
             }
-        };
-
+        }
+        let raw = self.settings_panel.mdns_hostname.trim();
         let snapshot = MdnsConfigSnapshot {
             enabled: self.settings_panel.mdns_enabled,
-            hostname,
+            hostname: if raw.is_empty() {
+                "gateway".into()
+            } else {
+                raw.into()
+            },
             gateway_ip: self.dashboard_info.gateway_ip.clone(),
         };
-
         if !force && !self.last_mdns_snapshot.needs_restart(&snapshot) {
-            // Snapshot unchanged: if we already failed, keep showing the error
-            // rather than retrying every frame.
-            if let Some(ref err) = self.last_mdns_failure {
-                self.settings_panel.mdns_status = mdns::MdnsStatus::Failed(err.clone());
-            }
             return;
         }
-
-        // Snapshot changed (or forced retry) — clear previous failure.
-        self.last_mdns_failure = None;
         self.last_mdns_snapshot = snapshot.clone();
-
-        if !snapshot.enabled {
-            self.settings_panel.mdns_status = mdns::MdnsStatus::Disabled;
-            if let Some(h) = self.mdns_handle.take() {
-                h.shutdown();
-            }
-            return;
-        }
-
-        if snapshot.gateway_ip.is_empty() {
-            self.settings_panel.mdns_status = mdns::MdnsStatus::WaitingForIp;
-            if let Some(h) = self.mdns_handle.take() {
-                h.shutdown();
-            }
-            return;
-        }
-
-        match MdnsHandle::start(&snapshot.hostname, &snapshot.gateway_ip) {
-            Ok(handle) => {
-                if let Err(e) = firewall::ensure_mdns_rule() {
-                    logger::log_to_file(&format!("mDNS firewall rule setup failed: {}", e));
-                }
-                self.last_mdns_failure = None;
-                self.settings_panel.mdns_status = mdns::MdnsStatus::Running;
-                self.mdns_handle = Some(handle);
-            }
-            Err(e) => {
-                logger::log_to_file(&format!("mDNS: start failed: {}", e));
-                self.last_mdns_failure = Some(e.clone());
-                self.settings_panel.mdns_status = mdns::MdnsStatus::Failed(e);
-                self.mdns_handle = None;
-            }
-        }
+        self.settings_panel.mdns_status = match self.mdns_controller.configure(snapshot) {
+            Ok(()) => mdns::MdnsStatus::Starting,
+            Err(e) => mdns::MdnsStatus::Failed(e),
+        };
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(229, 236, 246));
+        ui.visuals_mut().selection.bg_fill = crate::ui::theme::ACCENT;
+        ui.visuals_mut().selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
         ui.vertical(|ui| {
-            ui.heading(self.i18n.text("app.title"));
-            ui.separator();
-
-            ui.selectable_value(
-                &mut self.tab,
-                Tab::Dashboard,
-                self.i18n.text("tab.dashboard"),
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(self.i18n.text("app.title"))
+                    .size(22.0)
+                    .strong(),
             );
-            ui.selectable_value(
-                &mut self.tab,
-                Tab::Rules,
-                self.i18n.text("tab.forward_rules"),
+            ui.label(
+                egui::RichText::new(self.i18n.text("app.subtitle"))
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(158, 178, 203)),
             );
-            ui.selectable_value(&mut self.tab, Tab::Network, self.i18n.text("tab.network"));
-            ui.selectable_value(&mut self.tab, Tab::Settings, self.i18n.text("tab.settings"));
+            ui.add_space(24.0);
+            for (tab, key) in [
+                (Tab::Dashboard, "tab.dashboard"),
+                (Tab::Rules, "tab.forward_rules"),
+                (Tab::Network, "tab.network"),
+                (Tab::Settings, "tab.settings"),
+            ] {
+                let button = egui::Button::new(self.i18n.text(key))
+                    .selected(self.tab == tab)
+                    .fill(if self.tab == tab {
+                        crate::ui::theme::ACCENT
+                    } else {
+                        crate::ui::theme::SIDEBAR
+                    });
+                if ui.add_sized([ui.available_width(), 38.0], button).clicked() {
+                    self.tab = tab;
+                }
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                ui.small(format!("v{}", env!("CARGO_PKG_VERSION")));
+            });
         });
     }
 
@@ -545,7 +589,15 @@ impl LanGatewayApp {
         });
     }
 
-    fn start_update_download(&mut self) {
+    fn start_update_download(&mut self, ctx: &egui::Context) {
+        if let Some(error) = &self.config_load_error {
+            *self.update_status.lock().unwrap() =
+                UpdateStatus::Failed(format!("Config could not be loaded: {}", error));
+            return;
+        }
+        if self.rules_panel.is_busy() || self.update_result.is_some() {
+            return;
+        }
         let (download_url, latest_version) = {
             let s = self.update_status.lock().unwrap();
             match &*s {
@@ -570,9 +622,15 @@ impl LanGatewayApp {
 
         let config_to_save = self.effective_config();
         let config_path = self.config_path.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.update_result = Some(receiver);
+        let ctx = ctx.clone();
         std::thread::spawn(move || {
             if let Err(e) = config_to_save.save(&config_path) {
                 logger::log_to_file(&format!("Failed to save config before update: {}", e));
+                let _ = sender.send(Err(e));
+                ctx.request_repaint();
+                return;
             }
             logger::log_to_file(&format!(
                 "Starting update download: {} -> {}",
@@ -586,22 +644,40 @@ impl LanGatewayApp {
                 }
             };
 
-            match update::perform_update(&download_url, &latest_version, set_status) {
-                Ok(()) => {
-                    // process::exit called inside perform_update;
-                    // if we ever reach here, update status briefly
-                    if let Ok(mut s) = status.lock() {
-                        *s = UpdateStatus::Restarting;
-                    }
-                }
-                Err(e) => {
-                    logger::log_to_file(&format!("Update failed: {}", e));
-                    if let Ok(mut s) = status.lock() {
-                        *s = UpdateStatus::Failed(e);
-                    }
-                }
-            }
+            // A dropped receiver cancels an initialized helper through RAII.
+            let _ = sender.send(update::perform_update(
+                &download_url,
+                &latest_version,
+                set_status,
+            ));
+            ctx.request_repaint();
         });
+    }
+
+    fn apply_update_result(&mut self, ctx: &egui::Context) {
+        let result = match self
+            .update_result
+            .as_ref()
+            .map(|receiver| receiver.try_recv())
+        {
+            Some(Ok(result)) => result,
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => return,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                Err("Update worker disconnected before handoff".into())
+            }
+        };
+        self.update_result = None;
+        match result {
+            Ok(prepared) => {
+                prepared.commit();
+                self.close_after_operation = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(error) => {
+                logger::log_to_file(&format!("Update failed: {error}"));
+                *self.update_status.lock().unwrap() = UpdateStatus::Failed(error);
+            }
+        }
     }
 
     fn get_update_status(&self) -> UpdateStatus {
@@ -611,8 +687,17 @@ impl LanGatewayApp {
 
 impl eframe::App for LanGatewayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.viewport().close_requested())
+            && (self.rules_panel.is_busy() || self.update_result.is_some())
+        {
+            self.close_after_operation = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         // Check for background refresh completion
         self.try_apply_refresh();
+        self.rules_panel.apply_operation_results(&self.i18n);
+        self.apply_update_result(ctx);
+        self.dashboard_info.rule_count = self.rules_panel.proxy_entries.len();
         self.sync_mdns_state();
         self.maybe_refresh_for_mdns();
 
@@ -627,11 +712,18 @@ impl eframe::App for LanGatewayApp {
             state.orphan_health = self.rules_panel.orphan_health.clone();
             state.mdns_status = self.settings_panel.mdns_status.clone();
             state.update_status = self.get_update_status();
-            if self.rules_panel.health_check_running {
-                state.operation = OperationState::CheckingHealth;
-            } else if !matches!(state.operation, OperationState::Refreshing) {
-                state.operation = OperationState::Idle;
-            }
+            state.operation = if self.rules_panel.is_busy() {
+                OperationState::ApplyingRules
+            } else if matches!(
+                self.dashboard_info.refresh_state,
+                RefreshState::Refreshing { .. }
+            ) {
+                OperationState::Refreshing
+            } else if self.rules_panel.health_check_running {
+                OperationState::CheckingHealth
+            } else {
+                OperationState::Idle
+            };
         }
 
         // After initial refresh completes, auto-start health check once
@@ -648,24 +740,56 @@ impl eframe::App for LanGatewayApp {
             self.initial_update_check_done = true;
             self.start_update_check();
         }
+        let updating = matches!(
+            self.get_update_status(),
+            UpdateStatus::Downloading | UpdateStatus::PreparingUpdate | UpdateStatus::Restarting
+        );
+        self.rules_panel.operations_blocked = self.config_load_error.is_some()
+            || updating
+            || matches!(
+                self.dashboard_info.refresh_state,
+                RefreshState::Refreshing { .. }
+            );
 
         egui::SidePanel::left("sidebar")
-            .min_width(160.0)
+            .exact_width(184.0)
             .resizable(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(crate::ui::theme::SIDEBAR)
+                    .inner_margin(16),
+            )
             .show(ctx, |ui| {
                 self.sidebar(ui);
             });
 
         // TopBottomPanel must render before CentralPanel so it reserves space first
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(error) = &self.config_load_error {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 60),
+                        format!(
+                            "{}: {}",
+                            self.i18n.text("settings.config_load_failed"),
+                            error
+                        ),
+                    );
+                }
                 let i = &self.i18n;
                 let (op_label, op_busy, cfg_path) = self
                     .state
                     .lock()
                     .map(|s| {
                         (
-                            format!("{:?}", s.operation),
+                            i.text(match s.operation {
+                                OperationState::Idle => "status.idle",
+                                OperationState::Refreshing => "status.refreshing",
+                                OperationState::CheckingHealth => "status.checking_health",
+                                OperationState::ApplyingRules => "status.applying_rules",
+                                OperationState::Failed(_) => "rules.operation_failed",
+                            })
+                            .to_string(),
                             s.operation.is_busy(),
                             s.config_path.display().to_string(),
                         )
@@ -708,25 +832,38 @@ impl eframe::App for LanGatewayApp {
                 let update_status = self.get_update_status();
                 let mut check_update = false;
                 let mut download_update = false;
-                if self.dashboard.show(
-                    ui,
-                    &self.dashboard_info,
-                    &self.i18n,
-                    &update_status,
-                    &mut check_update,
-                    &mut download_update,
-                ) {
+                let refresh = egui::ScrollArea::vertical()
+                    .id_salt("dashboard_page")
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(!self.rules_panel.is_busy(), |ui| {
+                            self.dashboard.show(
+                                ui,
+                                &self.dashboard_info,
+                                &self.i18n,
+                                &update_status,
+                                &mut check_update,
+                                &mut download_update,
+                            )
+                        })
+                        .inner
+                    })
+                    .inner;
+                if refresh {
                     self.start_background_refresh();
                 }
                 if check_update {
                     self.start_update_check();
                 }
                 if download_update {
-                    self.start_update_download();
+                    self.start_update_download(ctx);
                 }
             }
             Tab::Rules => {
-                self.rules_panel.show(ui, &self.i18n);
+                egui::ScrollArea::vertical()
+                    .id_salt("rules_page")
+                    .show(ui, |ui| {
+                        self.rules_panel.show(ui, &self.i18n);
+                    });
             }
             Tab::Network => {
                 let effective_config = self.effective_config();
@@ -746,8 +883,13 @@ impl eframe::App for LanGatewayApp {
                 let prev_ip = self.settings_panel.preferred_gateway_ip.clone();
                 let prev_mdns_enabled = self.settings_panel.mdns_enabled;
                 let prev_mdns_hostname = self.settings_panel.mdns_hostname.clone();
-                self.settings_panel
-                    .show(ui, &self.dashboard_info, &mut self.i18n);
+                ui.add_enabled_ui(
+                    self.config_load_error.is_none() && !self.rules_panel.is_busy() && !updating,
+                    |ui| {
+                        self.settings_panel
+                            .show(ui, &self.dashboard_info, &mut self.i18n);
+                    },
+                );
                 if self.i18n.language() != prev_lang {
                     self.on_language_changed(self.i18n.language());
                 }
@@ -764,7 +906,6 @@ impl eframe::App for LanGatewayApp {
                 // Handle Retry mDNS button — force restart regardless of snapshot
                 if self.settings_panel.mdns_retry_requested {
                     self.settings_panel.mdns_retry_requested = false;
-                    self.last_mdns_failure = None;
                     self.sync_mdns_state_impl(true);
                 }
             }
@@ -775,9 +916,95 @@ impl eframe::App for LanGatewayApp {
             self.dashboard_info.refresh_state,
             RefreshState::Refreshing { .. }
         ) || self.rules_panel.health_check_running
+            || self.rules_panel.is_busy()
+            || matches!(self.settings_panel.mdns_status, mdns::MdnsStatus::Starting)
             || self.get_update_status().is_busy();
         if needs_repaint {
             ctx.request_repaint_after(std::time::Duration::from_millis(150));
         }
+        if self.settings_panel.mdns_enabled {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        if self.close_after_operation && !self.rules_panel.is_busy() && self.update_result.is_none()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.config_load_error.is_none() {
+            if let Some(ticket) = self.startup_ready.take() {
+                if let Err(error) = ticket.acknowledge() {
+                    logger::log_to_file(&format!(
+                        "Cannot acknowledge updated application startup: {error}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refresh(generation: u64, complete: bool) -> RefreshResult {
+        RefreshResult {
+            generation,
+            complete,
+            proxy_entries: None,
+            info: DashboardInfo {
+                hostname: "test-host".into(),
+                local_ipv4: vec![],
+                local_ipv6: vec![],
+                active_interface: String::new(),
+                is_admin: false,
+                rule_count: 0,
+                gateway_ip: String::new(),
+                interfaces: vec![],
+                refresh_state: if complete {
+                    RefreshState::Done { error: None }
+                } else {
+                    RefreshState::Refreshing { stage: "details" }
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn late_quick_results_cannot_overwrite_a_completed_full_refresh() {
+        assert!(!should_apply_refresh(
+            1,
+            &RefreshState::Done { error: None },
+            &refresh(1, false)
+        ));
+        assert!(should_apply_refresh(
+            1,
+            &RefreshState::Refreshing { stage: "startup" },
+            &refresh(1, true)
+        ));
+    }
+
+    #[test]
+    fn results_from_a_previous_refresh_cannot_overwrite_a_newer_refresh() {
+        let state = RefreshState::Refreshing { stage: "refresh" };
+        assert!(!should_apply_refresh(2, &state, &refresh(1, true)));
+        assert!(!should_apply_refresh(2, &state, &refresh(1, false)));
+        assert!(should_apply_refresh(2, &state, &refresh(2, false)));
+    }
+
+    #[test]
+    fn quick_refresh_keeps_other_proxy_modes_from_the_last_snapshot() {
+        let ipv4 = PortproxyEntry {
+            proxy_mode: crate::core::model::ProxyMode::V4ToV4,
+            listen_address: "0.0.0.0".into(),
+            listen_port: 8080,
+            connect_address: "127.0.0.1".into(),
+            connect_port: 80,
+        };
+        let mut ipv6 = ipv4.clone();
+        ipv6.proxy_mode = crate::core::model::ProxyMode::V6ToV4;
+        ipv6.listen_address = "::".into();
+        assert_eq!(
+            merge_quick_entries(vec![], &[ipv4, ipv6.clone()]),
+            vec![ipv6]
+        );
     }
 }
