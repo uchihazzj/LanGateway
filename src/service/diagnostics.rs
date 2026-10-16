@@ -108,14 +108,28 @@ pub fn build_report(
             let status = firewall::query_rule(&name);
             push_line(
                 &mut out,
-                &format!("- {} exists={}", status.name, status.exists),
+                &format!(
+                    "- {} {}",
+                    status.name,
+                    status.error.as_ref().map_or_else(
+                        || format!("exists={}", status.exists),
+                        |error| format!("query_failed={error}")
+                    )
+                ),
             );
         }
     }
     let mdns_fw = firewall::query_rule(firewall::MDNS_FIREWALL_RULE);
     push_line(
         &mut out,
-        &format!("- {} exists={}", mdns_fw.name, mdns_fw.exists),
+        &format!(
+            "- {} {}",
+            mdns_fw.name,
+            mdns_fw.error.as_ref().map_or_else(
+                || format!("exists={}", mdns_fw.exists),
+                |error| format!("query_failed={error}")
+            )
+        ),
     );
 
     push_line(&mut out, "");

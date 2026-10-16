@@ -10,6 +10,7 @@ pub const MDNS_FIREWALL_RULE: &str = "LanGateway-mDNS";
 pub struct FirewallRuleStatus {
     pub name: String,
     pub exists: bool,
+    pub error: Option<String>,
 }
 
 pub fn tcp_rule_name(rule: &ForwardRule) -> String {
@@ -40,7 +41,7 @@ pub fn ensure_tcp_rule_with(exec: &dyn CommandExecutor, rule: &ForwardRule) -> R
     }
 
     let name = tcp_rule_name(rule);
-    if query_rule_with(exec, &name).exists {
+    if rule_exists_with(exec, &name)? {
         delete_rule_with(exec, &name)?;
     }
     let port_arg = format!("localport={}", rule.listen_port);
@@ -97,16 +98,45 @@ pub fn query_rule(name: &str) -> FirewallRuleStatus {
 }
 
 pub fn query_rule_with(exec: &dyn CommandExecutor, name: &str) -> FirewallRuleStatus {
-    let name_arg = format!("name={}", name);
-    let output = exec.run(
-        "netsh",
-        &["advfirewall", "firewall", "show", "rule", &name_arg],
-    );
-
+    let result = rule_exists_with(exec, name);
     FirewallRuleStatus {
         name: name.to_string(),
-        exists: output.map(|o| o.status_success).unwrap_or(false),
+        exists: result.as_ref().copied().unwrap_or(false),
+        error: result.err(),
     }
+}
+
+pub fn rule_exists_with(exec: &dyn CommandExecutor, name: &str) -> Result<bool, String> {
+    let name_arg = format!("name={}", name);
+    let output = exec
+        .query(
+            "netsh",
+            &["advfirewall", "firewall", "show", "rule", &name_arg],
+        )
+        .map_err(|error| format!("Firewall query failed for {name}: {error}"))?;
+    if output.status_success {
+        return Ok(true);
+    }
+    let stdout = encoding::decode(&output.stdout);
+    let stderr = encoding::decode(&output.stderr);
+    let message = stdout
+        .trim()
+        .trim_start_matches('\u{feff}')
+        .trim_end_matches(['.', '。']);
+    // Exit code 1 also represents query errors. Only a recognized absence is safe.
+    if output.status_code == Some(1)
+        && stderr.trim().is_empty()
+        && (message.eq_ignore_ascii_case("No rules match the specified criteria")
+            || message == "没有与指定标准相匹配的规则")
+    {
+        return Ok(false);
+    }
+    Err(format!(
+        "Firewall query failed for {name} (exit {:?}): {} {}",
+        output.status_code,
+        stdout.chars().take(512).collect::<String>(),
+        stderr.chars().take(512).collect::<String>()
+    ))
 }
 
 fn run_firewall_command(exec: &dyn CommandExecutor, args: &[&str]) -> Result<(), String> {
@@ -134,6 +164,51 @@ mod tests {
     use crate::system::process::CommandOutput;
     use std::io;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn failed_query_is_unknown_and_does_not_start_a_firewall_mutation() {
+        struct TimeoutExecutor;
+        impl CommandExecutor for TimeoutExecutor {
+            fn run(&self, _: &str, _: &[&str]) -> io::Result<CommandOutput> {
+                panic!("a failed query must not start a mutation");
+            }
+            fn query(&self, _: &str, _: &[&str]) -> io::Result<CommandOutput> {
+                Err(io::Error::new(io::ErrorKind::TimedOut, "query timed out"))
+            }
+        }
+        let status = query_rule_with(&TimeoutExecutor, "test-rule");
+        assert!(status.error.unwrap().contains("timed out"));
+        assert!(ensure_tcp_rule_with(&TimeoutExecutor, &make_rule()).is_err());
+    }
+
+    #[test]
+    fn only_explicit_no_match_responses_mean_the_rule_is_absent() {
+        struct QueryReply(&'static str, &'static str);
+        impl CommandExecutor for QueryReply {
+            fn run(&self, _: &str, _: &[&str]) -> io::Result<CommandOutput> {
+                Ok(CommandOutput {
+                    status_success: false,
+                    status_code: Some(1),
+                    stdout: self.0.as_bytes().to_vec(),
+                    stderr: self.1.as_bytes().to_vec(),
+                })
+            }
+        }
+        for text in [
+            "\r\nNo rules match the specified criteria.\r\n",
+            "没有与指定标准相匹配的规则。",
+        ] {
+            assert!(!rule_exists_with(&QueryReply(text, ""), "test-rule").unwrap());
+        }
+        for (out, err) in [
+            ("Firewall service unavailable", ""),
+            ("", "Access denied"),
+            ("", ""),
+            ("No rules match the specified criteria.", "query failed"),
+        ] {
+            assert!(rule_exists_with(&QueryReply(out, err), "test-rule").is_err());
+        }
+    }
 
     #[derive(Clone, Default)]
     struct MockExecutor {

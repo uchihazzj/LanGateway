@@ -151,6 +151,15 @@ impl SettingsPanel {
                 MdnsStatus::Running => {
                     ui.colored_label(crate::ui::theme::SUCCESS, i18n.text("status.running"));
                 }
+                MdnsStatus::RunningWithWarning(error) => {
+                    ui.colored_label(
+                        crate::ui::theme::WARNING,
+                        i18n.text("settings.mdns_firewall_failed"),
+                    )
+                    .on_hover_text(error);
+                    self.mdns_retry_requested |=
+                        ui.button(i18n.text("settings.mdns_retry")).clicked();
+                }
                 MdnsStatus::Failed(err) => {
                     ui.colored_label(
                         crate::ui::theme::ERROR,
@@ -174,6 +183,12 @@ impl SettingsPanel {
                 }
             }
 
+            if matches!(
+                self.mdns_status,
+                MdnsStatus::Running | MdnsStatus::RunningWithWarning(_)
+            ) {
+                ui.label(i18n.text("settings.mdns_local_status"));
+            }
             let hostname = crate::service::mdns::validate_mdns_hostname(&self.mdns_hostname)
                 .unwrap_or_else(|_| {
                     if self.mdns_hostname.trim().is_empty() {

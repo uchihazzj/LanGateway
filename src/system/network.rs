@@ -5,7 +5,7 @@ use crate::system::{encoding, logger, process};
 use serde::Deserialize;
 
 pub fn get_hostname() -> Option<String> {
-    let output = process::run_command("hostname", &[]).ok()?;
+    let output = process::run_query("hostname", &[]).ok()?;
     if output.status.success() {
         Some(encoding::decode(&output.stdout).trim().to_string())
     } else {
@@ -16,7 +16,7 @@ pub fn get_hostname() -> Option<String> {
 /// Fast startup path: parse plain ipconfig output for IPv4 addresses without
 /// waiting for the heavier PowerShell adapter join.
 pub fn get_quick_interfaces() -> Vec<InterfaceInfo> {
-    let output = match process::run_command("ipconfig", &[]) {
+    let output = match process::run_query("ipconfig", &[]) {
         Ok(o) => o,
         Err(_) => return vec![],
     };
@@ -26,21 +26,18 @@ pub fn get_quick_interfaces() -> Vec<InterfaceInfo> {
 
 /// Primary: PowerShell Get-NetIPAddress + Get-NetAdapter → JSON, joined by InterfaceIndex.
 /// Falls back to ipconfig /all if PowerShell fails.
-pub fn get_active_interfaces() -> Vec<InterfaceInfo> {
+pub fn get_active_interfaces() -> Result<Vec<InterfaceInfo>, String> {
     if let Some(ifaces) = get_interfaces_via_powershell() {
-        if !ifaces.is_empty() {
-            logger::log_to_file(&format!(
-                "PowerShell: got {} interfaces, {} IPs",
-                ifaces
-                    .iter()
-                    .map(|i| i.name.as_str())
-                    .collect::<std::collections::HashSet<_>>()
-                    .len(),
-                ifaces.len()
-            ));
-            return ifaces;
-        }
-        logger::log_to_file("PowerShell: parsed 0 interfaces, falling back to ipconfig");
+        logger::log_to_file(&format!(
+            "PowerShell: got {} interfaces, {} IPs",
+            ifaces
+                .iter()
+                .map(|i| i.name.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            ifaces.len()
+        ));
+        return Ok(ifaces);
     } else {
         logger::log_to_file("PowerShell: failed to get interfaces, falling back to ipconfig");
     }
@@ -49,7 +46,7 @@ pub fn get_active_interfaces() -> Vec<InterfaceInfo> {
 
 fn get_interfaces_via_powershell() -> Option<Vec<InterfaceInfo>> {
     // Query both data sets in one PowerShell host instead of starting it twice.
-    let output = process::run_command(
+    let output = process::run_query(
         "powershell",
         &[
             "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
@@ -224,13 +221,28 @@ fn ps_address_family(value: &serde_json::Value) -> &'static str {
 }
 
 /// Fallback: parse `ipconfig /all` text output.
-fn get_interfaces_via_ipconfig() -> Vec<InterfaceInfo> {
-    let output = match process::run_command("ipconfig", &["/all"]) {
-        Ok(o) => o,
-        Err(_) => return vec![],
-    };
+fn get_interfaces_via_ipconfig() -> Result<Vec<InterfaceInfo>, String> {
+    let output = process::run_query("ipconfig", &["/all"])
+        .map_err(|error| format!("Network detection failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Network detection failed: ipconfig exited with {:?}",
+            output.status.code()
+        ));
+    }
     let text = encoding::decode(&output.stdout);
-    parse_ipconfig_interfaces(&text)
+    parse_ipconfig_fallback(&text)
+}
+
+fn parse_ipconfig_fallback(text: &str) -> Result<Vec<InterfaceInfo>, String> {
+    let interfaces = parse_ipconfig_interfaces(text);
+    if interfaces.is_empty() {
+        // Text output is localized, so an empty parse is not proof of a disconnection.
+        // Only a successful PowerShell snapshot can confirm an empty network.
+        Err("Network detection failed: ipconfig returned no recognized IPv4 addresses".into())
+    } else {
+        Ok(interfaces)
+    }
 }
 
 fn parse_ipconfig_interfaces(text: &str) -> Vec<InterfaceInfo> {
@@ -517,6 +529,18 @@ pub fn get_interface_for_ip<'a>(ip: &str, interfaces: &'a [InterfaceInfo]) -> &'
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrecognized_ipconfig_fallback_is_not_a_confirmed_empty_network() {
+        let text = "Windows-IP-Konfiguration\n\nEthernet-Adapter Ethernet:\n   IPv4-Adresse. . . . . . . . . . . : 192.0.2.10(Bevorzugt)\n";
+        assert!(parse_ipconfig_fallback(text).is_err());
+        assert!(parse_ipconfig_fallback("").is_err());
+        let english = "Ethernet adapter Ethernet:\n   IPv4 Address. . . . . . . . . . . : 192.0.2.10(Preferred)\n";
+        assert_eq!(
+            parse_ipconfig_fallback(english).unwrap()[0].ipv4,
+            "192.0.2.10"
+        );
+    }
 
     #[test]
     fn ipconfig_preserves_adapter_across_blank_lines() {

@@ -285,7 +285,7 @@ impl RuleService {
             .filter(|r| r.enabled && r.protocol == ProxyProtocol::Tcp && r.firewall_managed);
         let mut firewall_before = Vec::new();
         if let Some(rule) = old_rule.filter(|r| r.firewall_managed) {
-            let exists = firewall::query_rule_with(exec, &firewall::tcp_rule_name(rule)).exists;
+            let exists = firewall::rule_exists_with(exec, &firewall::tcp_rule_name(rule))?;
             firewall_before.push((rule.clone(), exists));
         }
         if let Some(rule) = new_firewall {
@@ -293,7 +293,7 @@ impl RuleService {
                 .iter()
                 .any(|(r, _)| firewall::tcp_rule_name(r) == firewall::tcp_rule_name(rule))
             {
-                let exists = firewall::query_rule_with(exec, &firewall::tcp_rule_name(rule)).exists;
+                let exists = firewall::rule_exists_with(exec, &firewall::tcp_rule_name(rule))?;
                 firewall_before.push((rule.clone(), exists));
             }
         }
@@ -340,8 +340,12 @@ impl RuleService {
                     let name = firewall::tcp_rule_name(rule);
                     if *existed {
                         record(firewall::ensure_tcp_rule_with(exec, rule));
-                    } else if firewall::query_rule_with(exec, &name).exists {
-                        record(firewall::delete_rule_with(exec, &name));
+                    } else {
+                        match firewall::rule_exists_with(exec, &name) {
+                            Ok(true) => record(firewall::delete_rule_with(exec, &name)),
+                            Ok(false) => {}
+                            Err(error) => record(Err(error)),
+                        }
                     }
                 }
             }
@@ -596,6 +600,7 @@ mod tests {
         fail_delete: bool,
         fail_firewall_add: bool,
         fail_firewall_delete: bool,
+        fail_firewall_query: bool,
     }
 
     #[derive(Default)]
@@ -661,7 +666,15 @@ mod tests {
             } else if args.contains(&"firewall") {
                 let name = value("name=");
                 match args[2] {
-                    "show" => success = state.firewall.contains_key(&name),
+                    "show" => {
+                        success = state.firewall.contains_key(&name);
+                        if state.fail_firewall_query {
+                            success = false;
+                            stdout = "Firewall service unavailable".into();
+                        } else if !success {
+                            stdout = "No rules match the specified criteria.".into();
+                        }
+                    }
                     "delete" => {
                         if std::mem::take(&mut state.fail_firewall_delete) {
                             success = false;
@@ -741,6 +754,39 @@ mod tests {
         assert_eq!(config.rules.len(), 1);
         assert_eq!(Config::load(&service.config_path).unwrap().rules.len(), 1);
         let _ = std::fs::remove_file(&service.config_path);
+    }
+
+    #[test]
+    fn firewall_query_failure_cannot_be_mistaken_for_a_missing_rule() {
+        let (service, executor) = test_service();
+        let mut rule = make_rule(8080);
+        rule.firewall_managed = true;
+        let mut config = Config {
+            rules: vec![rule.clone()],
+            ..Default::default()
+        };
+        {
+            let mut windows = executor.0.lock().unwrap();
+            windows.entries = vec![rule.netsh_entry()];
+            windows
+                .firewall
+                .insert(firewall::tcp_rule_name(&rule), 8080);
+            windows.fail_firewall_query = true;
+        }
+        let result = service.set_rule_enabled(&mut config, 0, false, true);
+        let windows = executor.0.lock().unwrap();
+        let untouched = config.rules[0].enabled
+            && windows.entries == vec![rule.netsh_entry()]
+            && windows
+                .firewall
+                .contains_key(&firewall::tcp_rule_name(&rule));
+        drop(windows);
+        let _ = std::fs::remove_file(&service.config_path);
+        assert!(
+            result.is_err(),
+            "an unknown firewall status must stop the transaction"
+        );
+        assert!(untouched);
     }
 
     #[test]

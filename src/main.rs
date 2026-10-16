@@ -24,9 +24,11 @@ fn main() -> Result<(), eframe::Error> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "LanGateway",
         options,
         Box::new(move |cc| Ok(Box::new(app::LanGatewayApp::new(cc, startup_ready)))),
-    )
+    );
+    system::logger::flush(std::time::Duration::from_millis(500));
+    result
 }

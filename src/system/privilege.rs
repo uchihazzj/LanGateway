@@ -1,7 +1,7 @@
 use crate::system::process;
 
 pub fn is_admin() -> bool {
-    process::run_command("net", &["session"])
+    process::run_query("net", &["session"])
         .map(|o| o.status.success())
         .unwrap_or(false)
 }

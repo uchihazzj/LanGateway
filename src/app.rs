@@ -26,6 +26,7 @@ enum Tab {
 struct RefreshResult {
     generation: u64,
     rules_generation: u64,
+    network_failed: bool,
     info: DashboardInfo,
     proxy_entries: Option<Vec<PortproxyEntry>>,
     complete: bool,
@@ -54,6 +55,25 @@ fn merge_quick_entries(
             .cloned(),
     );
     quick
+}
+
+fn preserve_network_on_failure(info: &mut DashboardInfo, previous: &DashboardInfo, failed: bool) {
+    if !failed || !info.interfaces.is_empty() || previous.interfaces.is_empty() {
+        return;
+    }
+    info.interfaces = previous.interfaces.clone();
+    info.local_ipv4 = previous.local_ipv4.clone();
+    info.local_ipv6 = previous.local_ipv6.clone();
+    info.gateway_ip = previous.gateway_ip.clone();
+    info.active_interface = previous.active_interface.clone();
+    if let RefreshState::Done { error } = &mut info.refresh_state {
+        let cached = "Network detection failed, showing cached data";
+        *error = Some(
+            error
+                .as_ref()
+                .map_or_else(|| cached.into(), |error| format!("{error}; {cached}")),
+        );
+    }
 }
 
 pub struct LanGatewayApp {
@@ -259,6 +279,7 @@ impl LanGatewayApp {
         RefreshResult {
             generation: 0,
             rules_generation: 0,
+            network_failed: false,
             info: DashboardInfo {
                 hostname,
                 local_ipv4: usable_ipv4s,
@@ -279,7 +300,13 @@ impl LanGatewayApp {
     fn build_full_dashboard_info(config: &Config, refresh_rules: bool) -> RefreshResult {
         let is_admin = privilege::is_admin();
         let hostname = network::get_hostname().unwrap_or_else(|| "unknown".into());
-        let interfaces = network::get_active_interfaces();
+        let (interfaces, network_error) = match network::get_active_interfaces() {
+            Ok(interfaces) => (interfaces, None),
+            Err(error) => {
+                logger::log_to_file(&error);
+                (Vec::new(), Some(error))
+            }
+        };
         let ipv4s = network::ipv4_addresses_from(&interfaces);
         let ipv6s = network::ipv6_addresses_from(&interfaces);
         let usable_ipv4s = network::usable_gateway_ipv4_addresses(&interfaces);
@@ -311,9 +338,16 @@ impl LanGatewayApp {
             proxy_entries.as_ref().map_or(0, Vec::len)
         ));
 
+        let network_failed = network_error.is_some();
+        let error = match (network_error, proxy_error) {
+            (Some(network), Some(proxy)) => Some(format!("{network}; {proxy}")),
+            (Some(network), None) => Some(network),
+            (None, proxy) => proxy,
+        };
         RefreshResult {
             generation: 0,
             rules_generation: 0,
+            network_failed,
             info: DashboardInfo {
                 hostname,
                 local_ipv4: usable_ipv4s,
@@ -323,7 +357,7 @@ impl LanGatewayApp {
                 rule_count: proxy_entries.as_ref().map_or(0, Vec::len),
                 gateway_ip,
                 interfaces,
-                refresh_state: RefreshState::Done { error: proxy_error },
+                refresh_state: RefreshState::Done { error },
             },
             proxy_entries,
             complete: true,
@@ -376,27 +410,9 @@ impl LanGatewayApp {
                 continue;
             }
             let mut info = result.info;
-            // If old state had interfaces but new state is empty, retain old network data
-            if info.interfaces.is_empty() && !self.dashboard_info.interfaces.is_empty() {
-                logger::log_to_file(
-                    "WARNING: refresh returned empty interfaces, retaining old network state",
-                );
-                info.interfaces = self.dashboard_info.interfaces.clone();
-                info.local_ipv4 = self.dashboard_info.local_ipv4.clone();
-                info.local_ipv6 = self.dashboard_info.local_ipv6.clone();
-                info.gateway_ip = self.dashboard_info.gateway_ip.clone();
-                info.active_interface = self.dashboard_info.active_interface.clone();
-                if result.complete {
-                    if let RefreshState::Done { error } = &mut info.refresh_state {
-                        let cached = "Network detection failed, showing cached data";
-                        *error =
-                            Some(error.as_ref().map_or_else(
-                                || cached.to_string(),
-                                |e| format!("{}; {}", e, cached),
-                            ));
-                    }
-                }
-            }
+            // A successful empty snapshot means the interface/address is gone.
+            // Only an actual query failure may retain the previous addresses.
+            preserve_network_on_failure(&mut info, &self.dashboard_info, result.network_failed);
             self.dashboard_info = info;
             self.recompute_gateway_ip_from_ui();
             // A rule edit can finish while this read-only query is in flight.
@@ -999,6 +1015,7 @@ mod tests {
         RefreshResult {
             generation,
             rules_generation: 0,
+            network_failed: false,
             complete,
             proxy_entries: None,
             info: DashboardInfo {
@@ -1017,6 +1034,33 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn confirmed_empty_network_snapshot_does_not_keep_an_old_mdns_address() {
+        let mut previous = refresh(0, true).info;
+        previous.gateway_ip = "192.0.2.10".into();
+        previous.local_ipv4 = vec!["192.0.2.10".into()];
+        previous.interfaces = vec![crate::core::model::InterfaceInfo {
+            name: "Ethernet".into(),
+            ipv4: "192.0.2.10".into(),
+            ipv6: vec![],
+            mac: String::new(),
+            is_virtual: false,
+        }];
+        let mut disconnected = refresh(1, true).info;
+        preserve_network_on_failure(&mut disconnected, &previous, false);
+        assert!(disconnected.gateway_ip.is_empty());
+        assert!(disconnected.interfaces.is_empty());
+
+        let mut failed = refresh(1, true).info;
+        preserve_network_on_failure(&mut failed, &previous, true);
+        assert_eq!(failed.gateway_ip, "192.0.2.10");
+        assert_eq!(failed.interfaces.len(), 1);
+        assert!(matches!(
+            failed.refresh_state,
+            RefreshState::Done { error: Some(_) }
+        ));
     }
 
     #[test]

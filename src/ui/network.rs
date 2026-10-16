@@ -93,6 +93,11 @@ impl NetworkPanel {
                             MdnsStatus::Disabled => i18n.text("status.disabled").to_owned(),
                             MdnsStatus::Starting => i18n.text("status.starting").to_owned(),
                             MdnsStatus::Running => i18n.text("status.running").to_owned(),
+                            MdnsStatus::RunningWithWarning(_) => format!(
+                                "{} ({})",
+                                i18n.text("status.running"),
+                                i18n.text("settings.mdns_firewall_warning")
+                            ),
                             MdnsStatus::WaitingForIp => {
                                 i18n.text("settings.mdns_err_no_ip").to_owned()
                             }
@@ -190,6 +195,18 @@ impl NetworkPanel {
                     ui.ctx().request_repaint_after(Duration::from_millis(200));
                 }
                 for status in &self.firewall_statuses {
+                    if let Some(error) = &status.error {
+                        ui.colored_label(
+                            crate::ui::theme::WARNING,
+                            format!(
+                                "{}: {}",
+                                status.name,
+                                i18n.text("network.firewall_query_failed")
+                            ),
+                        )
+                        .on_hover_text(error);
+                        continue;
+                    }
                     ui.label(format!(
                         "{}: {}",
                         status.name,

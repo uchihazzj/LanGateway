@@ -7,7 +7,7 @@ Windows desktop tool for managing `netsh interface portproxy` TCP forwarding rul
 - **Dashboard** - Hostname, Gateway IP, usable IPv4 addresses, active interface, admin status, rule count, and update status.
 - **Forward Rules** - Add, edit, enable, disable, delete, and adopt Windows PortProxy rules with TOML persistence.
 - **Readable Interface** - A consistent light theme with 16-point body text, high-contrast status colors, outlined inputs, and visible scrollbars. The dark sidebar uses explicit light text, including its title.
-- **Responsive Interface** - Consistent navigation and spacing, a gateway summary card, and scrollable pages for long rule lists and smaller windows. Rule tables use the available page width, keep address-and-port endpoints and health labels on one line, and scroll horizontally when needed instead of splitting addresses. Names, flags, tags, and notes remain available on hover when truncated. Table headings stay on one line and action buttons reserve their full row height in both languages, including at the minimum 800 × 560 window size.
+- **Responsive Interface** - Consistent navigation and spacing, a gateway summary card, and scrollable pages for long rule lists and smaller windows. Rule tables use the available page width, keep address-and-port endpoints and health labels on one line, and scroll horizontally when needed instead of splitting addresses. Names, flags, tags, and notes remain available on hover when truncated. Table headings stay on one line. Managed-rule actions (Enable/Disable, Edit, Delete) share one compact row with unwrapped labels in both languages; narrow windows use horizontal scrolling, including at the minimum 800 × 560 window size.
 - **TCP Proxy Modes** - Supports `v4tov4`, `v4tov6`, `v6tov4`, and `v6tov6` Windows PortProxy modes.
 - **Rule Preflight** - Checks duplicate managed rules, existing Windows rules, target DNS/address family, admin permission, and TCP-only support.
 - **Firewall Automation** - Optional per-rule inbound TCP firewall rule management using stable names like `LanGateway-<rule-id>`.
@@ -42,6 +42,8 @@ Logs are stored at:
 C:\ProgramData\LanGateway\logs\langateway.log
 ```
 
+Log writes run on one background worker so periodic refreshes do not wait for disk access on the UI thread. The queue holds up to 128 messages, each limited to about 8 KiB. If storage stalls and the queue fills, new messages are dropped and a count is written when logging resumes. Diagnostics read at most the last 256 KiB of the log instead of loading the entire history. Shutdown and diagnostic export use a bounded, best-effort log flush.
+
 Diagnostics export writes:
 
 ```text
@@ -70,6 +72,8 @@ Configuration saves write a complete temporary file in the same directory and th
 Rule changes, rule refresh, mDNS startup/shutdown, and diagnostics collection run in the background. Conflicting edits are temporarily disabled while rules are being changed. Closing the window during a rule operation waits for its result before exiting. Operation messages remain visible until dismissed or replaced by another result.
 
 Read-only status and rule refreshes keep the last results visible and leave rule editing available. Refreshing rules preserves any unfinished form. Only the matching refresh button is disabled to prevent duplicate queries; a query that began before a rule change cannot replace that change's newer Windows snapshot. With mDNS enabled, the 30-second poll refreshes network information only, without re-querying PortProxy. Adapter/address discovery uses one PowerShell process per full network refresh; the quick startup query runs only at startup.
+
+Read-only Windows queries have a 15-second limit per command and a combined 1 MiB stdout/stderr limit. A failed query requests termination, waits up to one additional second for cleanup, and releases its captured pipes; a cleanup failure includes the query PID in the error. PortProxy refresh waits for all four query workers to finish before returning an error. Query failures retain the previous rule/network snapshot where available. Firewall-query errors are shown as unknown status and stop rule changes that require a reliable firewall snapshot. Only an explicit English or Simplified Chinese "no matching rules" response is treated as absence; other unsuccessful responses remain errors. Commands that change Windows rules or request UAC elevation are not cancelled by the read-only query limit.
 
 Before changing a rule, LanGateway reads the current Windows entries and checks listener conflicts across modes sharing the same IP family, including wildcard listeners. Configuration is committed after the Windows and firewall operations succeed. On failure, the app keeps the previous configuration and attempts to restore the affected Windows entries and firewall rules. If restoration also fails, the error includes the rollback failure; refresh status and inspect the affected rules before retrying. A missing Windows entry does not prevent deleting its saved configuration.
 
@@ -105,6 +109,12 @@ mDNS currently provides host A-record resolution. The per-rule "Publish mDNS" fl
 
 For campus networks where the PC IP changes, keep LanGateway running with mDNS enabled. It periodically refreshes the selected Gateway IP and restarts the responder when the IP changes, so new mDNS answers point at the new address. Client devices may still cache the old answer briefly.
 
+This publishes the IPv4 address of the computer running LanGateway. It does not discover another server's changing address or configure clients' DNS servers. The responder uses IPv4 multicast; IPv6-only multicast clients are not supported. A successful PowerShell network scan with no addresses stops the old responder and enters the waiting-for-IP state; a failed scan keeps cached network data with an error. Empty or unrecognized fallback `ipconfig` output is treated as a scan failure, since its localized text cannot confirm a disconnection. Unexpected responder failures are reported so they can be retried from Settings.
+
+On Windows, multicast loopback stays enabled so the responder can receive queries from browsers and resolver processes on the same computer. Replies are ignored as queries. "Running" confirms that the local responder started, not that another device can resolve the name. A firewall-setup failure remains visible as a warning with its details on hover; run as Administrator and retry if the rule needs to be created. LanGateway does not request elevation automatically.
+
+The responder remains experimental: name-conflict probing and unsolicited startup/IP-change announcements are not implemented. Choose a unique `.local` name. With the 30-second network poll and 30-second answer TTL, address changes are not instantaneous. Multicast must be allowed between the client and server on the local link; sharing a campus or an IP prefix alone does not establish that.
+
 mDNS uses standard UDP port 5353. LanGateway attempts a shared bind with `SO_REUSEADDR` and can create a firewall rule named `LanGateway-mDNS`, but some systems or processes may still prevent mDNS from starting.
 
 Common UDP 5353 occupants include Chrome Cast Discovery, Steam, and Windows DNS Client (`Dnscache`). If mDNS cannot start, use direct IP access, a client hosts-file entry, router DNS, or campus DNS as a fallback. If the campus network blocks multicast between clients, `.local` discovery may not work across that network segment.
@@ -114,6 +124,8 @@ For a quick manual mDNS check from this repo, run:
 ```bash
 python scripts/query_mdns.py gateway.local
 ```
+
+Run that query on the client device as well as on the server. With a VPN or multiple adapters, select the **client's own** LAN IPv4 address using `--interface <client-LAN-IPv4>`. The script only reports records matching the requested name, exits with status 1 if none arrive, and does not treat a raw UDP answer as proof that a browser's resolver or the service port works. Compare direct-IP access and `.local` access using the same service port. `nslookup` normally tests a configured unicast DNS server, so it is not this multicast check.
 
 ## Startup Refresh
 
@@ -171,6 +183,7 @@ cargo build --release
 ```bash
 cargo check
 cargo test
+python -B -m unittest discover -s scripts -p test_query_mdns.py
 ```
 
 The updater can also be tested without changing an installed application. Run `scripts/test_update.ps1 -ScratchRoot <existing-writable-scratch-directory>` from PowerShell. It compiles disposable fixture programs and tests only files in a fresh scratch subdirectory. On machines where Windows PowerShell 5.1 disables local scripts, the explicit `-AllowLocalFixtureScripts` test option sets `RemoteSigned` only for fixture helper processes; it changes no persistent policy.

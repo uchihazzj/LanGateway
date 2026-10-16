@@ -23,14 +23,29 @@ pub fn show_all() -> Result<Vec<PortproxyEntry>, String> {
         .map(|mode| std::thread::spawn(move || show_mode_with(&SystemCommandExecutor, mode)))
         .collect();
 
+    collect_mode_results(handles)
+}
+
+fn collect_mode_results(
+    handles: Vec<std::thread::JoinHandle<Result<Vec<PortproxyEntry>, String>>>,
+) -> Result<Vec<PortproxyEntry>, String> {
     let mut entries = Vec::new();
+    let mut first_error = None;
     for handle in handles {
-        let mut mode_entries = handle
-            .join()
-            .map_err(|_| "netsh show worker thread panicked".to_string())??;
-        entries.append(&mut mode_entries);
+        match handle.join() {
+            Ok(Ok(mut mode_entries)) => entries.append(&mut mode_entries),
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| "netsh show worker thread panicked".into());
+            }
+        }
     }
-    Ok(entries)
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(entries),
+    }
 }
 
 pub fn show_v4tov4() -> Result<Vec<PortproxyEntry>, String> {
@@ -51,7 +66,7 @@ fn show_mode_with(
     proxy_mode: ProxyMode,
 ) -> Result<Vec<PortproxyEntry>, String> {
     let output = exec
-        .run(
+        .query(
             "netsh",
             &["interface", "portproxy", "show", proxy_mode.netsh_name()],
         )
@@ -264,6 +279,41 @@ mod tests {
     use crate::system::process::CommandOutput;
     use std::io;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn failed_mode_does_not_detach_other_query_workers() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handles = vec![
+            std::thread::spawn(|| Err("query failed".into())),
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok(Vec::new())
+            }),
+        ];
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            done_tx.send(collect_mode_results(handles)).unwrap();
+        });
+        let early = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+        release_tx.send(()).unwrap();
+        collector.join().unwrap();
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "query returned before the other worker completed"
+        );
+        assert_eq!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err(),
+            "query failed"
+        );
+    }
 
     #[derive(Clone, Default)]
     struct MockExecutor {

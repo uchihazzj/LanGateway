@@ -1,6 +1,5 @@
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +32,7 @@ pub enum MdnsStatus {
     Disabled,
     Starting,
     Running,
+    RunningWithWarning(String),
     Failed(String),
     #[allow(dead_code)]
     Conflict(String),
@@ -45,6 +45,9 @@ impl fmt::Display for MdnsStatus {
             MdnsStatus::Disabled => write!(f, "Disabled"),
             MdnsStatus::Starting => write!(f, "Starting"),
             MdnsStatus::Running => write!(f, "Running"),
+            MdnsStatus::RunningWithWarning(error) => {
+                write!(f, "Running (firewall warning: {error})")
+            }
             MdnsStatus::Failed(e) => write!(f, "Failed: {}", e),
             MdnsStatus::Conflict(e) => write!(f, "Conflict: {}", e),
             MdnsStatus::WaitingForIp => write!(f, "Waiting for usable IP"),
@@ -65,7 +68,33 @@ impl MdnsController {
         let (updates, results) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut handle: Option<MdnsHandle> = None;
-            while let Ok(mut snapshot) = requests.recv() {
+            let mut active_snapshot: Option<MdnsConfigSnapshot> = None;
+            loop {
+                let request = if handle.is_some() {
+                    requests.recv_timeout(Duration::from_millis(250))
+                } else {
+                    requests
+                        .recv()
+                        .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+                };
+                let mut snapshot = match request {
+                    Ok(snapshot) => snapshot,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(error) = handle.as_mut().and_then(MdnsHandle::finished_error) {
+                            handle = None;
+                            if let Some(snapshot) = &active_snapshot {
+                                if updates
+                                    .send((snapshot.clone(), MdnsStatus::Failed(error)))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                };
                 while let Ok(latest) = requests.try_recv() {
                     snapshot = latest;
                 }
@@ -81,14 +110,15 @@ impl MdnsController {
                         .and_then(|hostname| MdnsHandle::start(&hostname, &snapshot.gateway_ip))
                     {
                         Ok(next) => {
-                            if let Err(e) = crate::system::firewall::ensure_mdns_rule() {
+                            let firewall = crate::system::firewall::ensure_mdns_rule();
+                            if let Err(e) = &firewall {
                                 crate::system::logger::log_to_file(&format!(
                                     "mDNS firewall rule setup failed: {}",
                                     e
                                 ));
                             }
                             handle = Some(next);
-                            MdnsStatus::Running
+                            running_status(firewall)
                         }
                         Err(e) => {
                             crate::system::logger::log_to_file(&format!(
@@ -99,6 +129,7 @@ impl MdnsController {
                         }
                     }
                 };
+                active_snapshot = Some(snapshot.clone());
                 if updates.send((snapshot, status)).is_err() {
                     break;
                 }
@@ -115,6 +146,13 @@ impl MdnsController {
 
     pub fn try_result(&self) -> Option<(MdnsConfigSnapshot, MdnsStatus)> {
         self.results.try_recv().ok()
+    }
+}
+
+fn running_status(firewall: Result<(), String>) -> MdnsStatus {
+    match firewall {
+        Ok(()) => MdnsStatus::Running,
+        Err(error) => MdnsStatus::RunningWithWarning(error),
     }
 }
 
@@ -275,6 +313,10 @@ fn build_a_response(
 /// Create a UDP socket bound to 0.0.0.0:5353 with SO_REUSEADDR and joined to
 /// the mDNS multicast group on `interface_ip`.
 fn create_mdns_socket(interface_ip: &str) -> Result<UdpSocket, String> {
+    create_mdns_socket_on_port(interface_ip, MDNS_PORT)
+}
+
+fn create_mdns_socket_on_port(interface_ip: &str, port: u16) -> Result<UdpSocket, String> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let gateway: Ipv4Addr = interface_ip
@@ -291,10 +333,10 @@ fn create_mdns_socket(interface_ip: &str) -> Result<UdpSocket, String> {
 
     sock.bind(&socket2::SockAddr::from(SocketAddrV4::new(
         Ipv4Addr::UNSPECIFIED,
-        MDNS_PORT,
+        port,
     )))
-    .map_err(|e| format!("bind 0.0.0.0:5353: {}", e))?;
-    crate::system::logger::log_to_file("mDNS: socket bound to 0.0.0.0:5353");
+    .map_err(|e| format!("bind 0.0.0.0:{port}: {e}"))?;
+    crate::system::logger::log_to_file(&format!("mDNS: socket bound to 0.0.0.0:{port}"));
 
     sock.join_multicast_v4(&MDNS_MULTICAST_V4, &gateway)
         .map_err(|e| {
@@ -310,12 +352,15 @@ fn create_mdns_socket(interface_ip: &str) -> Result<UdpSocket, String> {
 
     sock.set_multicast_ttl_v4(255)
         .map_err(|e| format!("set multicast TTL: {}", e))?;
+    sock.set_ttl(255)
+        .map_err(|e| format!("set unicast TTL: {e}"))?;
     sock.set_multicast_if_v4(&gateway)
         .map_err(|e| format!("set multicast interface: {}", e))?;
 
-    // Don't receive our own multicast packets.
-    sock.set_multicast_loop_v4(false)
-        .map_err(|e| format!("set multicast loop off: {}", e))?;
+    // Winsock applies IP_MULTICAST_LOOP on receive: disabling it also hides
+    // queries from other local apps. Our DNS QR check already ignores replies.
+    sock.set_multicast_loop_v4(true)
+        .map_err(|e| format!("enable multicast loopback: {e}"))?;
 
     sock.set_nonblocking(false)
         .map_err(|e| format!("set blocking: {}", e))?;
@@ -330,7 +375,7 @@ fn create_mdns_socket(interface_ip: &str) -> Result<UdpSocket, String> {
 
 pub struct MdnsHandle {
     stop_flag: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<Result<(), String>>>,
 }
 
 impl Drop for MdnsHandle {
@@ -394,9 +439,7 @@ impl MdnsHandle {
 
         let thread = std::thread::Builder::new()
             .name("mDNS_responder".into())
-            .spawn(move || {
-                responder_loop(socket, &host_fqdn_owned, &ip_owned, &stop);
-            })
+            .spawn(move || responder_loop(socket, &host_fqdn_owned, &ip_owned, &stop))
             .map_err(|e| format!("spawn mDNS thread: {}", e))?;
 
         crate::system::logger::log_to_file(&format!(
@@ -407,6 +450,17 @@ impl MdnsHandle {
         Ok(MdnsHandle {
             stop_flag,
             thread: Some(thread),
+        })
+    }
+
+    fn finished_error(&mut self) -> Option<String> {
+        if !self.thread.as_ref()?.is_finished() {
+            return None;
+        }
+        Some(match self.thread.take()?.join() {
+            Ok(Err(error)) => error,
+            Ok(Ok(())) => "mDNS responder stopped unexpectedly".into(),
+            Err(_) => "mDNS responder thread panicked".into(),
         })
     }
 
@@ -425,7 +479,12 @@ impl MdnsHandle {
 // Responder thread
 // ---------------------------------------------------------------------------
 
-fn responder_loop(socket: UdpSocket, host_fqdn: &str, ip: &str, stop: &AtomicBool) {
+fn responder_loop(
+    socket: UdpSocket,
+    host_fqdn: &str,
+    ip: &str,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     let mut buf = [0u8; RECV_BUF_LEN];
     let multicast_dest = SocketAddrV4::new(MDNS_MULTICAST_V4, MDNS_PORT);
     let mut query_count: u64 = 0;
@@ -439,12 +498,15 @@ fn responder_loop(socket: UdpSocket, host_fqdn: &str, ip: &str, stop: &AtomicBoo
             let goodbye = build_a_response(host_fqdn, ip, 0, None, 0);
             let _ = socket.send_to(&goodbye, multicast_dest);
             crate::system::logger::log_to_file("mDNS: goodbye sent, responder exiting");
-            return;
+            return Ok(());
         }
 
         match socket.recv_from(&mut buf) {
             Ok((len, src)) => {
                 let data = &buf[..len];
+                if !is_dns_query(data) {
+                    continue;
+                }
                 query_count += 1;
 
                 // Parse all questions for sampling and matching.
@@ -476,14 +538,28 @@ fn responder_loop(socket: UdpSocket, host_fqdn: &str, ip: &str, stop: &AtomicBoo
                 }
             }
             Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+                if e.raw_os_error() == Some(10040) // Winsock WSAEMSGSIZE: discard this datagram.
+                    || matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
+                ) => {}
             Err(e) => {
                 crate::system::logger::log_to_file(&format!("mDNS: recv error: {}", e));
-                std::thread::sleep(Duration::from_millis(200));
+                return Err(format!("mDNS receive failed: {e}"));
             }
         }
     }
+}
+
+fn is_dns_query(data: &[u8]) -> bool {
+    data.len() >= 12
+        && data[2] & 0xF8 == 0 // Query, standard opcode.
+        && data[3] & 0x0F == 0 // No response error code.
+        && data[4..6] != [0, 0]
 }
 
 /// Iterate over all questions in a DNS packet, log samples, and send
@@ -498,11 +574,7 @@ fn process_queries(
     sampled: &mut std::collections::HashMap<(String, u16, u16), u64>,
     src: SocketAddrV4,
 ) -> bool {
-    if data.len() < 12 {
-        return false;
-    }
-    // Skip responses.
-    if data[2] & 0x80 != 0 {
+    if !is_dns_query(data) {
         return false;
     }
 
@@ -547,7 +619,7 @@ fn process_queries(
 
         // ----- matching -----
         let name_match = qname_lower == our_fqdn || qname_lower == our_fqdn_dot;
-        let class_ok = qclass_base == 1; // IN class (strip unicast bit)
+        let class_ok = qclass_base == 1 || qclass_base == 255; // IN or ANY.
 
         if !name_match || !class_ok {
             continue;
@@ -689,19 +761,20 @@ fn log_periodic_summary(
 
 /// Diagnostic helper: return a human-readable list of processes on UDP 5353.
 fn get_5353_owner_info() -> Option<String> {
-    let output = std::process::Command::new("powershell.exe")
-        .args([
+    let output = crate::system::process::run_query(
+        "powershell.exe",
+        &[
             "-NoProfile",
+            "-NonInteractive",
             "-Command",
             "Get-NetUDPEndpoint -LocalPort 5353 -ErrorAction SilentlyContinue | \
              ForEach-Object { \
                $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue; \
                Write-Output \"$($p.ProcessName) (PID $($_.OwningProcess))\" \
              }",
-        ])
-        .creation_flags(0x0800_0000)
-        .output()
-        .ok()?;
+        ],
+    )
+    .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -718,6 +791,167 @@ fn get_5353_owner_info() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn firewall_setup_failure_is_reported_without_hiding_the_responder() {
+        let status = running_status(Err("administrator permission required".into()));
+        assert!(
+            matches!(&status, MdnsStatus::RunningWithWarning(error) if error.contains("administrator"))
+        );
+        assert!(status.to_string().contains("firewall warning"));
+        assert!(matches!(running_status(Ok(())), MdnsStatus::Running));
+    }
+
+    #[test]
+    fn completed_responder_failure_can_be_reported_to_the_ui() {
+        let mut handle = MdnsHandle {
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            thread: Some(std::thread::spawn(|| {
+                Err("network became unavailable".into())
+            })),
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !handle.thread.as_ref().unwrap().is_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            handle.finished_error().as_deref(),
+            Some("network became unavailable")
+        );
+        assert!(handle.finished_error().is_none());
+    }
+
+    #[test]
+    fn only_standard_questions_are_counted_as_queries() {
+        let mut query = vec![0; 12];
+        query[5] = 1;
+        assert!(is_dns_query(&query));
+        query[2] = 0x84;
+        assert!(!is_dns_query(&query));
+        query[2] = 0x08;
+        assert!(!is_dns_query(&query));
+        query[2] = 0;
+        query[3] = 3;
+        assert!(!is_dns_query(&query));
+        assert!(!is_dns_query(&[0; 3]));
+    }
+
+    #[test]
+    fn class_any_questions_receive_an_internet_a_record() {
+        let responder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let std::net::SocketAddr::V4(source) = client.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut query = vec![0; 12];
+        query[5] = 1;
+        query.extend_from_slice(&encode_dns_name("gateway.local"));
+        query.extend_from_slice(&[0, 1, 0, 255]);
+        assert!(process_queries(
+            &query,
+            "gateway.local",
+            "192.0.2.10",
+            &responder,
+            &mut 0,
+            &mut std::collections::HashMap::new(),
+            source
+        ));
+        let mut response = [0; 1500];
+        let (len, _) = client.recv_from(&mut response).unwrap();
+        assert_eq!(&response[len - 4..len], &[192, 0, 2, 10]);
+    }
+
+    #[test]
+    fn oversized_datagram_does_not_stop_subsequent_queries() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let destination = socket.local_addr().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = std::thread::spawn(move || {
+            responder_loop(socket, "gateway.local", "192.0.2.10", &worker_stop)
+        });
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        client
+            .send_to(&vec![0; RECV_BUF_LEN + 32], destination)
+            .unwrap();
+        let mut query = vec![0; 12];
+        query[5] = 1;
+        query.extend_from_slice(&encode_dns_name("gateway.local"));
+        query.extend_from_slice(&[0, 1, 0, 1]);
+        client.send_to(&query, destination).unwrap();
+        let mut response = [0; 1500];
+        let reply = client.recv_from(&mut response);
+        stop.store(true, Ordering::SeqCst);
+        let worker_result = worker.join().unwrap();
+        assert!(worker_result.is_ok(), "{worker_result:?}");
+        let (len, _) = reply.expect("normal query failed after an oversized datagram");
+        assert_eq!(&response[len - 4..len], &[192, 0, 2, 10]);
+    }
+
+    #[test]
+    fn local_multicast_query_receives_our_a_record_on_windows() {
+        let responder = create_mdns_socket_on_port("127.0.0.1", 0).unwrap();
+        responder
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        let client = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        client
+            .bind(&SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        client.set_multicast_if_v4(&Ipv4Addr::LOCALHOST).unwrap();
+        client.set_multicast_loop_v4(true).unwrap();
+        let client: UdpSocket = client.into();
+        client
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        let mut query = vec![0; 12];
+        query[4..6].copy_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&encode_dns_name("gateway.local"));
+        query.extend_from_slice(&[0, 1, 0, 1]);
+        client
+            .send_to(
+                &query,
+                (MDNS_MULTICAST_V4, responder.local_addr().unwrap().port()),
+            )
+            .unwrap();
+        let mut packet = [0; 1500];
+        let (len, source) = responder
+            .recv_from(&mut packet)
+            .expect("responder did not receive the local multicast query");
+        let std::net::SocketAddr::V4(source) = source else {
+            panic!("expected IPv4");
+        };
+        assert!(process_queries(
+            &packet[..len],
+            "gateway.local",
+            "192.0.2.10",
+            &responder,
+            &mut 0,
+            &mut std::collections::HashMap::new(),
+            source
+        ));
+        let (len, _) = client.recv_from(&mut packet).unwrap();
+        let (question, end) = decode_dns_name(&packet[..len], 12).unwrap();
+        let (answer, _) = decode_dns_name(&packet[..len], end + 4).unwrap();
+        assert_eq!(question, "gateway.local");
+        assert_eq!(answer, question);
+        assert_eq!(&packet[len - 4..len], &[192, 0, 2, 10]);
+    }
 
     #[test]
     fn legacy_response_and_goodbye_name_the_owned_host() {

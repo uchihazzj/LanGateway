@@ -612,39 +612,39 @@ impl RulesPanel {
                                 )
                                 .on_hover_text(health.detail());
 
-                                ui.vertical(|ui| {
-                                    ui.set_width(132.0);
+                                ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 6.0;
                                     ui.spacing_mut().button_padding = egui::vec2(7.0, 5.0);
-                                    ui.horizontal(|ui| {
-                                        let toggle_label = if rule.enabled {
-                                            i18n.text("btn.disable")
-                                        } else {
-                                            i18n.text("btn.enable")
-                                        };
-                                        if ui
-                                            .add_enabled(
-                                                self.is_admin,
-                                                egui::Button::new(toggle_label),
-                                            )
-                                            .clicked()
-                                        {
-                                            toggle_idx = Some((i, !rule.enabled));
-                                        }
-                                        if ui
-                                            .add_enabled(
-                                                self.is_admin,
-                                                egui::Button::new(i18n.text("btn.edit")),
-                                            )
-                                            .clicked()
-                                        {
-                                            edit_idx = Some(i);
-                                        }
-                                    });
+                                    let toggle_label = if rule.enabled {
+                                        i18n.text("btn.disable")
+                                    } else {
+                                        i18n.text("btn.enable")
+                                    };
                                     if ui
                                         .add_enabled(
                                             self.is_admin,
-                                            egui::Button::new(i18n.text("btn.delete")),
+                                            egui::Button::new(toggle_label)
+                                                .wrap_mode(egui::TextWrapMode::Extend),
+                                        )
+                                        .clicked()
+                                    {
+                                        toggle_idx = Some((i, !rule.enabled));
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.is_admin,
+                                            egui::Button::new(i18n.text("btn.edit"))
+                                                .wrap_mode(egui::TextWrapMode::Extend),
+                                        )
+                                        .clicked()
+                                    {
+                                        edit_idx = Some(i);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            self.is_admin,
+                                            egui::Button::new(i18n.text("btn.delete"))
+                                                .wrap_mode(egui::TextWrapMode::Extend),
                                         )
                                         .clicked()
                                     {
