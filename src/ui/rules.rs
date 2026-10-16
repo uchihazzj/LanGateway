@@ -385,7 +385,7 @@ impl RulesPanel {
         }
         ui.add_enabled_ui(!self.is_busy() && !self.operations_blocked, |ui| {
             if !self.last_preflight.is_empty() {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                crate::ui::theme::card(ui).show(ui, |ui| {
                     ui.strong(i18n.text("rules.preflight"));
                     for item in &self.last_preflight {
                         ui.label(item);
@@ -450,37 +450,72 @@ impl RulesPanel {
         egui::ScrollArea::horizontal()
             .id_salt("managed_rules_scroll")
             .show(ui, |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                crate::ui::theme::card(ui).show(ui, |ui| {
                     egui::Grid::new("rules_grid")
-                        .num_columns(10)
-                        .spacing([8.0, 4.0])
+                        .num_columns(5)
+                        .max_col_width(128.0)
+                        .spacing([14.0, 10.0])
+                        .min_row_height(44.0)
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.strong(i18n.text("col.name"));
-                            ui.strong(i18n.text("col.mode"));
-                            ui.strong(i18n.text("col.listen_addr"));
-                            ui.strong(i18n.text("col.listen_port"));
-                            ui.strong(i18n.text("col.connect_addr"));
-                            ui.strong(i18n.text("col.connect_port"));
-                            ui.strong(i18n.text("col.flags"));
-                            ui.strong(i18n.text("col.notes"));
-                            ui.strong(i18n.text("col.health"));
-                            ui.strong(i18n.text("col.action"));
+                            for key in [
+                                "col.name",
+                                "col.listen_endpoint",
+                                "col.target_endpoint",
+                                "col.health",
+                                "col.action",
+                            ] {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(i18n.text(key)).strong())
+                                        .extend(),
+                                );
+                            }
                             ui.end_row();
 
                             for (i, rule) in self.config.rules.iter().enumerate() {
-                                ui.label(&rule.name);
-                                ui.label(format!(
-                                    "{} {}",
-                                    rule.protocol.label(),
-                                    rule.proxy_mode.label()
-                                ));
-                                ui.label(&rule.listen_address);
-                                ui.label(rule.listen_port.to_string());
-                                ui.label(&rule.connect_address);
-                                ui.label(rule.connect_port.to_string());
-                                ui.label(rule_flags(rule));
-                                ui.label(&rule.notes);
+                                ui.vertical(|ui| {
+                                    ui.set_width(120.0);
+                                    let details = format!(
+                                        "{}: {}\n{}: {}\n{}",
+                                        i18n.text("col.flags"),
+                                        rule_flags(rule),
+                                        i18n.text("col.notes"),
+                                        rule.notes,
+                                        rule.tags.join(", "),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(&rule.name).strong())
+                                            .truncate(),
+                                    )
+                                    .on_hover_text(&details);
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(format!(
+                                                "{} / {} · {}",
+                                                rule.protocol.label(),
+                                                rule.proxy_mode.label(),
+                                                rule_flags(rule),
+                                            ))
+                                            .small()
+                                            .color(crate::ui::theme::MUTED),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(details);
+                                    if !rule.notes.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&rule.notes)
+                                                    .small()
+                                                    .color(crate::ui::theme::MUTED),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&rule.notes);
+                                    }
+                                });
+                                ui.monospace(endpoint(&rule.listen_address, rule.listen_port));
+                                ui.monospace(endpoint(&rule.connect_address, rule.connect_port));
 
                                 let health =
                                     self.health_map.get(&i).unwrap_or(&HealthStatus::NotChecked);
@@ -490,27 +525,35 @@ impl RulesPanel {
                                 )
                                 .on_hover_text(health.detail());
 
-                                ui.horizontal(|ui| {
-                                    let toggle_label = if rule.enabled {
-                                        i18n.text("btn.disable")
-                                    } else {
-                                        i18n.text("btn.enable")
-                                    };
-                                    if ui
-                                        .add_enabled(self.is_admin, egui::Button::new(toggle_label))
-                                        .clicked()
-                                    {
-                                        toggle_idx = Some((i, !rule.enabled));
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            self.is_admin,
-                                            egui::Button::new(i18n.text("btn.edit")),
-                                        )
-                                        .clicked()
-                                    {
-                                        edit_idx = Some(i);
-                                    }
+                                ui.vertical(|ui| {
+                                    ui.set_width(132.0);
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.spacing_mut().button_padding = egui::vec2(7.0, 5.0);
+                                    ui.horizontal(|ui| {
+                                        let toggle_label = if rule.enabled {
+                                            i18n.text("btn.disable")
+                                        } else {
+                                            i18n.text("btn.enable")
+                                        };
+                                        if ui
+                                            .add_enabled(
+                                                self.is_admin,
+                                                egui::Button::new(toggle_label),
+                                            )
+                                            .clicked()
+                                        {
+                                            toggle_idx = Some((i, !rule.enabled));
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                self.is_admin,
+                                                egui::Button::new(i18n.text("btn.edit")),
+                                            )
+                                            .clicked()
+                                        {
+                                            edit_idx = Some(i);
+                                        }
+                                    });
                                     if ui
                                         .add_enabled(
                                             self.is_admin,
@@ -562,27 +605,32 @@ impl RulesPanel {
         egui::ScrollArea::horizontal()
             .id_salt("orphan_rules_scroll")
             .show(ui, |ui| {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
+                crate::ui::theme::card(ui).show(ui, |ui| {
                     egui::Grid::new("orphan_grid")
-                        .num_columns(7)
-                        .spacing([8.0, 4.0])
+                        .num_columns(5)
+                        .max_col_width(128.0)
+                        .spacing([14.0, 10.0])
+                        .min_row_height(40.0)
                         .striped(true)
                         .show(ui, |ui| {
-                            ui.strong(i18n.text("col.mode"));
-                            ui.strong(i18n.text("col.listen_addr"));
-                            ui.strong(i18n.text("col.listen_port"));
-                            ui.strong(i18n.text("col.connect_addr"));
-                            ui.strong(i18n.text("col.connect_port"));
-                            ui.strong(i18n.text("col.health"));
-                            ui.strong(i18n.text("col.action"));
+                            for key in [
+                                "col.mode",
+                                "col.listen_endpoint",
+                                "col.target_endpoint",
+                                "col.health",
+                                "col.action",
+                            ] {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(i18n.text(key)).strong())
+                                        .extend(),
+                                );
+                            }
                             ui.end_row();
 
                             for (i, entry) in orphans.iter().enumerate() {
                                 ui.label(entry.proxy_mode.label());
-                                ui.label(&entry.listen_address);
-                                ui.label(entry.listen_port.to_string());
-                                ui.label(&entry.connect_address);
-                                ui.label(entry.connect_port.to_string());
+                                ui.monospace(endpoint(&entry.listen_address, entry.listen_port));
+                                ui.monospace(endpoint(&entry.connect_address, entry.connect_port));
 
                                 let key = OrphanKey::from_entry(entry);
                                 let status = self
@@ -596,6 +644,7 @@ impl RulesPanel {
                                 .on_hover_text(status.detail());
 
                                 ui.horizontal(|ui| {
+                                    ui.set_width(154.0);
                                     if ui
                                         .add_enabled(
                                             self.is_admin,
@@ -642,7 +691,7 @@ impl RulesPanel {
     fn show_add_form(&mut self, ui: &mut egui::Ui, i18n: &I18n) {
         let is_editing = self.editing_rule_index.is_some();
 
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        crate::ui::theme::card(ui).show(ui, |ui| {
             egui::Grid::new("add_form")
                 .num_columns(2)
                 .spacing([12.0, 6.0])
@@ -728,10 +777,7 @@ impl RulesPanel {
             });
 
             if self.add_protocol == ProxyProtocol::Udp {
-                ui.colored_label(
-                    egui::Color32::from_rgb(200, 160, 0),
-                    i18n.text("rules.udp_note"),
-                );
+                ui.colored_label(crate::ui::theme::WARNING, i18n.text("rules.udp_note"));
             }
 
             ui.add_space(6.0);
@@ -877,6 +923,14 @@ impl RulesPanel {
             ));
         }
         self.last_preflight = notes;
+    }
+}
+
+fn endpoint(address: &str, port: u16) -> String {
+    if address.contains(':') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
     }
 }
 

@@ -52,10 +52,12 @@ impl NetworkPanel {
         ui.heading(i18n.text("network.title"));
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            crate::ui::theme::card(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.strong(i18n.text("network.summary"));
                 egui::Grid::new("network_summary_grid")
                     .num_columns(2)
+                    .min_row_height(22.0)
                     .spacing([16.0, 6.0])
                     .show(ui, |ui| {
                         ui.label(i18n.text("dashboard.gateway_ip"));
@@ -87,13 +89,27 @@ impl NetworkPanel {
                         ui.end_row();
 
                         ui.label("mDNS");
-                        ui.label(mdns_status.to_string());
+                        ui.label(match mdns_status {
+                            MdnsStatus::Disabled => i18n.text("status.disabled").to_owned(),
+                            MdnsStatus::Starting => i18n.text("status.starting").to_owned(),
+                            MdnsStatus::Running => i18n.text("status.running").to_owned(),
+                            MdnsStatus::WaitingForIp => {
+                                i18n.text("settings.mdns_err_no_ip").to_owned()
+                            }
+                            MdnsStatus::Failed(error) => {
+                                format!("{}: {error}", i18n.text("settings.mdns_err_failed"))
+                            }
+                            MdnsStatus::Conflict(error) => {
+                                format!("{}: {error}", i18n.text("settings.mdns_err_conflict"))
+                            }
+                        });
                         ui.end_row();
                     });
             });
 
             ui.add_space(10.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            crate::ui::theme::card(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.strong(i18n.text("network.adapters"));
                 if info.interfaces.is_empty() {
                     ui.label(i18n.text("status.no_adapters"));
@@ -151,22 +167,21 @@ impl NetworkPanel {
             });
 
             ui.add_space(10.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            crate::ui::theme::card(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.strong(i18n.text("network.preflight"));
                 if preflight.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0, 160, 90),
-                        i18n.text("network.preflight_ok"),
-                    );
+                    ui.colored_label(crate::ui::theme::SUCCESS, i18n.text("network.preflight_ok"));
                 } else {
                     for item in preflight {
-                        ui.colored_label(egui::Color32::from_rgb(200, 160, 0), item);
+                        ui.colored_label(crate::ui::theme::WARNING, item);
                     }
                 }
             });
 
             ui.add_space(10.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            crate::ui::theme::card(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.strong(i18n.text("network.firewall"));
                 let firewall_names = Self::firewall_rule_names(config);
                 self.ensure_firewall_refresh(firewall_names);
@@ -175,12 +190,21 @@ impl NetworkPanel {
                     ui.ctx().request_repaint_after(Duration::from_millis(200));
                 }
                 for status in &self.firewall_statuses {
-                    ui.label(format!("{}: exists={}", status.name, status.exists));
+                    ui.label(format!(
+                        "{}: {}",
+                        status.name,
+                        i18n.text(if status.exists {
+                            "network.firewall_present"
+                        } else {
+                            "network.firewall_missing"
+                        })
+                    ));
                 }
             });
 
             ui.add_space(10.0);
-            egui::Frame::group(ui.style()).show(ui, |ui| {
+            crate::ui::theme::card(ui).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.strong(i18n.text("network.diagnostics"));
                 if ui
                     .add_enabled(

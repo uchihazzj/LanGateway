@@ -43,7 +43,7 @@ pub fn setup_fonts(ctx: &egui::Context) -> bool {
         .families
         .get_mut(&FontFamily::Monospace)
         .unwrap()
-        .insert(0, "cjk".to_string());
+        .push("cjk".to_string());
 
     ctx.set_fonts(fonts);
     true

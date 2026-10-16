@@ -190,10 +190,10 @@ impl HealthStatus {
 
     pub fn color(&self) -> egui::Color32 {
         match self {
-            HealthStatus::NotChecked => egui::Color32::GRAY,
-            HealthStatus::Healthy => egui::Color32::from_rgb(0, 180, 80),
-            HealthStatus::TargetUnreachable(_) => egui::Color32::from_rgb(220, 80, 60),
-            HealthStatus::MetadataOnly => egui::Color32::from_rgb(200, 160, 0),
+            HealthStatus::NotChecked => egui::Color32::from_rgb(71, 85, 105),
+            HealthStatus::Healthy => egui::Color32::from_rgb(21, 112, 68),
+            HealthStatus::TargetUnreachable(_) => egui::Color32::from_rgb(180, 35, 45),
+            HealthStatus::MetadataOnly => egui::Color32::from_rgb(146, 79, 0),
         }
     }
 }

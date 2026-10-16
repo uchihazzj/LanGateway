@@ -1691,7 +1691,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "langateway"
-version = "0.3.8"
+version = "0.3.9"
 dependencies = [
  "eframe",
  "egui",

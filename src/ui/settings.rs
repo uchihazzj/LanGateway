@@ -31,7 +31,8 @@ impl SettingsPanel {
     fn show_language(&mut self, ui: &mut egui::Ui, i18n: &mut I18n) {
         ui.add_space(4.0);
         ui.strong(i18n.text("settings.language"));
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        crate::ui::theme::card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 let current = i18n.language();
                 let zh_selected = current == Language::ZhCn;
@@ -50,7 +51,8 @@ impl SettingsPanel {
     fn show_preferred_ip(&mut self, ui: &mut egui::Ui, info: &DashboardInfo, i18n: &I18n) {
         section_gap(ui);
         ui.strong(i18n.text("settings.preferred_gateway_ip"));
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        crate::ui::theme::card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.radio_value(
                 &mut self.preferred_gateway_ip,
                 "auto".to_string(),
@@ -91,7 +93,8 @@ impl SettingsPanel {
     fn show_adapter_list(&self, ui: &mut egui::Ui, info: &DashboardInfo, i18n: &I18n) {
         section_gap(ui);
         ui.strong(i18n.text("settings.adapter_list"));
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        crate::ui::theme::card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             for iface in &info.interfaces {
                 let vtag = if iface.is_virtual {
                     format!(" [{}]", i18n.text("settings.suspected_virtual"))
@@ -123,17 +126,18 @@ impl SettingsPanel {
         section_gap(ui);
         ui.strong(i18n.text("settings.mdns"));
         ui.colored_label(
-            egui::Color32::from_rgb(200, 160, 0),
+            crate::ui::theme::WARNING,
             i18n.text("settings.mdns_experimental"),
         );
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        crate::ui::theme::card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             let has_ip = !info.gateway_ip.is_empty();
             ui.add_enabled_ui(has_ip || self.mdns_enabled, |ui| {
                 ui.checkbox(&mut self.mdns_enabled, i18n.text("settings.mdns_enable"));
             });
             if !has_ip {
                 ui.colored_label(
-                    egui::Color32::from_rgb(200, 160, 0),
+                    crate::ui::theme::WARNING,
                     i18n.text("settings.mdns_err_no_ip"),
                 );
             }
@@ -145,11 +149,11 @@ impl SettingsPanel {
                     ui.spinner();
                 }
                 MdnsStatus::Running => {
-                    ui.colored_label(egui::Color32::from_rgb(0, 180, 80), "Running");
+                    ui.colored_label(crate::ui::theme::SUCCESS, i18n.text("status.running"));
                 }
                 MdnsStatus::Failed(err) => {
                     ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 60),
+                        crate::ui::theme::ERROR,
                         format!("{}: {}", i18n.text("settings.mdns_err_failed"), err),
                     );
                     ui.add_space(4.0);
@@ -158,13 +162,13 @@ impl SettingsPanel {
                 }
                 MdnsStatus::Conflict(err) => {
                     ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 60),
+                        crate::ui::theme::ERROR,
                         format!("{}: {}", i18n.text("settings.mdns_err_conflict"), err),
                     );
                 }
                 MdnsStatus::WaitingForIp => {
                     ui.colored_label(
-                        egui::Color32::from_rgb(200, 160, 0),
+                        crate::ui::theme::WARNING,
                         i18n.text("settings.mdns_err_no_ip"),
                     );
                 }
@@ -208,7 +212,7 @@ impl SettingsPanel {
             });
             ui.add_space(6.0);
             ui.colored_label(
-                egui::Color32::from_rgb(180, 160, 80),
+                crate::ui::theme::WARNING,
                 i18n.text("settings.mdns_port_note"),
             );
             ui.label(i18n.text("settings.mdns_firewall_hint"));
@@ -219,7 +223,8 @@ impl SettingsPanel {
     fn show_firewall_notes(&self, ui: &mut egui::Ui, i18n: &I18n) {
         section_gap(ui);
         ui.strong(i18n.text("settings.firewall"));
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        crate::ui::theme::card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.label(i18n.text("settings.fw_planned"));
             ui.add_space(4.0);
             ui.label(i18n.text("settings.fw_desc1"));
@@ -233,7 +238,8 @@ impl SettingsPanel {
     fn show_config(&self, ui: &mut egui::Ui, i18n: &I18n) {
         section_gap(ui);
         ui.strong(i18n.text("settings.config"));
-        egui::Frame::group(ui.style()).show(ui, |ui| {
+        crate::ui::theme::card(ui).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.label(format!(
                 "{}: {}",
                 i18n.text("settings.config_file"),

@@ -463,12 +463,13 @@ impl LanGatewayApp {
             ui.label(
                 egui::RichText::new(self.i18n.text("app.title"))
                     .size(22.0)
-                    .strong(),
+                    .strong()
+                    .color(egui::Color32::WHITE),
             );
             ui.label(
                 egui::RichText::new(self.i18n.text("app.subtitle"))
-                    .size(12.0)
-                    .color(egui::Color32::from_rgb(158, 178, 203)),
+                    .size(13.0)
+                    .color(egui::Color32::from_rgb(193, 207, 226)),
             );
             ui.add_space(24.0);
             for (tab, key) in [
@@ -477,14 +478,18 @@ impl LanGatewayApp {
                 (Tab::Network, "tab.network"),
                 (Tab::Settings, "tab.settings"),
             ] {
-                let button = egui::Button::new(self.i18n.text(key))
-                    .selected(self.tab == tab)
-                    .fill(if self.tab == tab {
-                        crate::ui::theme::ACCENT
-                    } else {
-                        crate::ui::theme::SIDEBAR
-                    });
-                if ui.add_sized([ui.available_width(), 38.0], button).clicked() {
+                let button = egui::Button::new(
+                    egui::RichText::new(self.i18n.text(key)).color(egui::Color32::WHITE),
+                )
+                .selected(self.tab == tab)
+                .corner_radius(6)
+                .stroke(egui::Stroke::NONE)
+                .fill(if self.tab == tab {
+                    crate::ui::theme::ACCENT
+                } else {
+                    crate::ui::theme::SIDEBAR
+                });
+                if ui.add_sized([ui.available_width(), 42.0], button).clicked() {
                     self.tab = tab;
                 }
             }
@@ -765,10 +770,13 @@ impl eframe::App for LanGatewayApp {
 
         // TopBottomPanel must render before CentralPanel so it reserves space first
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.style_mut()
+                .text_styles
+                .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
             ui.horizontal_wrapped(|ui| {
                 if let Some(error) = &self.config_load_error {
                     ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 60),
+                        crate::ui::theme::ERROR,
                         format!(
                             "{}: {}",
                             self.i18n.text("settings.config_load_failed"),
@@ -827,7 +835,9 @@ impl eframe::App for LanGatewayApp {
         });
 
         // CentralPanel fills remaining space after SidePanel and TopBottomPanel
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+        let central_panel = egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(18));
+        central_panel.show(ctx, |ui| match self.tab {
             Tab::Dashboard => {
                 let update_status = self.get_update_status();
                 let mut check_update = false;

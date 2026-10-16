@@ -48,6 +48,7 @@ impl DashboardPanel {
                 ui.add_space(12.0);
                 egui::Grid::new("dashboard_grid")
                     .num_columns(2)
+                    .min_row_height(22.0)
                     .spacing([20.0, 8.0])
                     .show(ui, |ui| {
                         ui.label(format!("{}:", i18n.text("dashboard.hostname")));
@@ -80,7 +81,7 @@ impl DashboardPanel {
 
         if !info.is_admin {
             ui.colored_label(
-                egui::Color32::from_rgb(200, 160, 0),
+                crate::ui::theme::WARNING,
                 i18n.text("dashboard.read_only_hint"),
             );
             ui.add_space(8.0);
@@ -119,7 +120,7 @@ impl DashboardPanel {
         if let Some(ref err) = self.elevation_error {
             ui.add_space(4.0);
             ui.colored_label(
-                egui::Color32::from_rgb(220, 80, 60),
+                crate::ui::theme::ERROR,
                 format!("{}: {}", i18n.text("dashboard.elevation_failed"), err),
             );
         }
@@ -131,10 +132,7 @@ impl DashboardPanel {
             }
             RefreshState::Done { error, .. } => {
                 if let Some(err) = error {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 60),
-                        format!("Refresh failed: {}", err),
-                    );
+                    ui.colored_label(crate::ui::theme::ERROR, format!("Refresh failed: {}", err));
                 }
             }
         }
@@ -172,11 +170,14 @@ impl DashboardPanel {
         match update_status {
             UpdateStatus::Idle => {}
             UpdateStatus::Checking => {
-                ui.colored_label(egui::Color32::GRAY, i18n.text("dashboard.update_checking"));
+                ui.colored_label(
+                    crate::ui::theme::MUTED,
+                    i18n.text("dashboard.update_checking"),
+                );
             }
             UpdateStatus::UpToDate => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(0, 180, 80),
+                    crate::ui::theme::SUCCESS,
                     i18n.text("dashboard.update_uptodate"),
                 );
             }
@@ -186,7 +187,7 @@ impl DashboardPanel {
                 download_url: _,
             } => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(200, 160, 0),
+                    crate::ui::theme::WARNING,
                     format!("{}: {}", i18n.text("dashboard.update_available"), latest),
                 );
                 ui.horizontal(|ui| {
@@ -198,25 +199,25 @@ impl DashboardPanel {
             }
             UpdateStatus::Downloading => {
                 ui.colored_label(
-                    egui::Color32::YELLOW,
+                    crate::ui::theme::WARNING,
                     i18n.text("dashboard.update_downloading"),
                 );
             }
             UpdateStatus::PreparingUpdate => {
                 ui.colored_label(
-                    egui::Color32::YELLOW,
+                    crate::ui::theme::WARNING,
                     i18n.text("dashboard.update_preparing"),
                 );
             }
             UpdateStatus::Restarting => {
                 ui.colored_label(
-                    egui::Color32::GREEN,
+                    crate::ui::theme::SUCCESS,
                     i18n.text("dashboard.update_restarting"),
                 );
             }
             UpdateStatus::Failed(e) => {
                 ui.colored_label(
-                    egui::Color32::from_rgb(220, 80, 60),
+                    crate::ui::theme::ERROR,
                     format!("{}: {}", i18n.text("dashboard.update_failed"), e),
                 );
             }

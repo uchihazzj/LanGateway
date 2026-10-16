@@ -6,7 +6,8 @@ Windows desktop tool for managing `netsh interface portproxy` TCP forwarding rul
 
 - **Dashboard** - Hostname, Gateway IP, usable IPv4 addresses, active interface, admin status, rule count, and update status.
 - **Forward Rules** - Add, edit, enable, disable, delete, and adopt Windows PortProxy rules with TOML persistence.
-- **Responsive Interface** - Consistent navigation and spacing, a gateway summary card, and scrollable pages for long rule lists and smaller windows.
+- **Readable Interface** - A consistent light theme with 16-point body text, high-contrast status colors, outlined inputs, and visible scrollbars. The dark sidebar uses explicit light text, including its title.
+- **Responsive Interface** - Consistent navigation and spacing, a gateway summary card, and scrollable pages for long rule lists and smaller windows. Rule tables combine each address and port into one endpoint, retain actions in a compact column, and show full names, flags, tags, and notes on hover when truncated. At the minimum 800 × 560 window size, wide tables scroll horizontally to keep all actions accessible; table headings stay on one line and action buttons reserve their full row height in both languages.
 - **TCP Proxy Modes** - Supports `v4tov4`, `v4tov6`, `v6tov4`, and `v6tov6` Windows PortProxy modes.
 - **Rule Preflight** - Checks duplicate managed rules, existing Windows rules, target DNS/address family, admin permission, and TCP-only support.
 - **Firewall Automation** - Optional per-rule inbound TCP firewall rule management using stable names like `LanGateway-<rule-id>`.
